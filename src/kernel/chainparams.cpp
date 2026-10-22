@@ -9,6 +9,7 @@
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
+#include <daa.h>
 #include <crypto/hex_base.h>
 #include <hash.h>
 #include <kernel/messagestartchars.h>
@@ -600,6 +601,12 @@ public:
         consensus.fPowAllowMinDifficultyBlocks = true;
         consensus.enforce_BIP94 = opts.enforce_bip94;
         consensus.fPowNoRetargeting = true;
+        // Explicit test mode only. Standard regtest keeps all legacy behavior;
+        // in test mode the active DAA ignores no-retarget/min-difficulty escapes.
+        if (opts.test_daa) {
+            if (opts.enforce_bip94) throw std::invalid_argument("DAA test mode cannot be combined with BIP94");
+            consensus.DAAHeight = daa::REGTEST_HEIGHT;
+        }
 
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;

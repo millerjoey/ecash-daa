@@ -28,7 +28,9 @@ HeadersSyncState::HeadersSyncState(NodeId id,
       m_minimum_required_work(minimum_required_work),
       m_current_chain_work(chain_start.nChainWork),
       m_last_header_received(m_chain_start.GetBlockHeader()),
-      m_current_height(chain_start.nHeight)
+      m_current_height(chain_start.nHeight),
+      m_daa_presync(consensus_params, chain_start),
+      m_daa_redownload(consensus_params, chain_start)
 {
     // Estimate the number of blocks that could possibly exist on the peer's
     // chain *right now* using 6 blocks/second (fastest blockrate given the MTP
@@ -192,6 +194,11 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& curren
         return false;
     }
 
+    if (!m_daa_presync.Check(m_consensus_params, next_height, current)) {
+        LogDebug(BCLog::NET, "Initial headers sync aborted: incorrect anchored target (presync phase)\n");
+        return false;
+    }
+
     if (next_height % m_params.commitment_period == m_commit_offset) {
         // Add a commitment.
         m_header_commitments.push_back(m_hasher(current.GetHash()) & 1);
@@ -237,6 +244,11 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
     if (!PermittedDifficultyTransition(m_consensus_params, next_height,
                 previous_nBits, header.nBits)) {
         LogDebug(BCLog::NET, "Initial headers sync aborted with peer=%d: invalid difficulty transition at height=%i (redownload phase)\n", m_id, next_height);
+        return false;
+    }
+
+    if (!m_daa_redownload.Check(m_consensus_params, next_height, header)) {
+        LogDebug(BCLog::NET, "Initial headers sync aborted: incorrect anchored target (redownload phase)\n");
         return false;
     }
 
