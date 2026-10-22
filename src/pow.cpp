@@ -7,6 +7,7 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <daa_algorithm.h>
 #include <primitives/block.h>
 #include <uint256.h>
 #include <util/check.h>
@@ -14,6 +15,8 @@
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
 {
     assert(pindexLast != nullptr);
+    if (daa::Active(params, int64_t{pindexLast->nHeight} + 1))
+        return daa::GetWorkRequired(*pindexLast, params);
     unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
 
     // Only change once per difficulty adjustment interval
@@ -95,6 +98,9 @@ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t heig
     // Full validation requires this reset even when it exceeds legacy bounds.
     if (height == params.EcashHeight && params.EcashForkBits != 0)
         return new_nbits == params.EcashForkBits && DeriveTarget(new_nbits, params.powLimit).has_value();
+
+    if (daa::Active(params, height))
+        return daa::PermittedTransition(params, height, old_nbits, new_nbits);
 
     if (params.fPowAllowMinDifficultyBlocks) return true;
 
