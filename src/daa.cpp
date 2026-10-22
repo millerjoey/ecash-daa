@@ -11,13 +11,13 @@
 namespace daa {
 bool Active(const Consensus::Params& params, int64_t height)
 {
-    assert(!params.DAAHeight || (*params.DAAHeight > 0 && *params.DAAHeight > params.EcashHeight));
+    assert(!params.DAAHeight || (*params.DAAHeight >= 2 && *params.DAAHeight > params.EcashHeight));
     return params.DAAHeight && height >= *params.DAAHeight;
 }
 
 bool Retarget(const Consensus::Params& params, int64_t height)
 {
-    return Active(params, height) && height > *params.DAAHeight && (height - *params.DAAHeight) % INTERVAL == 0;
+    return Active(params, height) && height > *params.DAAHeight;
 }
 
 arith_uint256 ScaleTarget(const arith_uint256& target, uint64_t numerator, uint64_t denominator, const arith_uint256& limit)

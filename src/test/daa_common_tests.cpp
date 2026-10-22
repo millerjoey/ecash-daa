@@ -31,7 +31,7 @@ BOOST_AUTO_TEST_CASE(disabled_public_parameters_and_independent_periods)
     const int h = *p.DAAHeight;
     BOOST_CHECK(!daa::Active(p, h - 1));
     BOOST_CHECK(daa::Active(p, h));
-    for (int n = h; n < h + 433; ++n) BOOST_CHECK_EQUAL(daa::Retarget(p, n), n > h && (n - h) % 144 == 0);
+    for (int n = h; n < h + 433; ++n) BOOST_CHECK_EQUAL(daa::Retarget(p, n), n > h);
 }
 
 BOOST_AUTO_TEST_CASE(overflow_safe_scaling)

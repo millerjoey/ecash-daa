@@ -7,6 +7,7 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <daa_headers.h>
 #include <consensus/params.h>
 #include <net.h>
 #include <primitives/block.h>
@@ -278,6 +279,9 @@ private:
 
     /** Current state of our headers sync. */
     State m_download_state{State::PRESYNC};
+
+    daa::HeaderState m_daa_presync;
+    daa::HeaderState m_daa_redownload;
 };
 
 #endif // BITCOIN_HEADERSSYNC_H

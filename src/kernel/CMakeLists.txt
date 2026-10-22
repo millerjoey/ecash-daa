@@ -43,6 +43,7 @@ add_library(bitcoinkernel
   ../policy/truc_policy.cpp
   ../pow.cpp
   ../daa.cpp
+  ../daa_algorithm.cpp
   ../primitives/block.cpp
   ../primitives/transaction.cpp
   ../pubkey.cpp
