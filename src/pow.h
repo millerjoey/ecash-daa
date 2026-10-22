@@ -38,11 +38,13 @@ bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Par
  * given height is not possible, given the proof-of-work on the prior block as
  * specified by old_nbits.
  *
- * This function only checks that the new value is within a factor of 4 of the
+ * Before experimental DAA activation, this function checks a factor of 4 of the
  * old value for blocks at the difficulty adjustment interval, and otherwise
- * requires the values to be the same.
+ * requires the values to be the same, except for the prescribed eCash reset.
+ * The experimental regime uses its own schedule and algorithm bounds. An
+ * unbounded anchored transition needs additional anchor context in headerssync.
  *
- * Always returns true on networks where min difficulty blocks are allowed,
+ * Before activation, returns true on networks where min difficulty blocks are allowed,
  * such as regtest/testnet.
  */
 bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits);
