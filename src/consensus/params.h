@@ -13,6 +13,7 @@
 #include <chrono>
 #include <limits>
 #include <map>
+#include <optional>
 #include <vector>
 
 namespace Consensus {
@@ -88,6 +89,9 @@ struct Params {
     int EcashHeight{0};
     /** Compact target the block at EcashHeight must carry. */
     uint32_t EcashForkBits{0};
+    /** Experimental DAA activation, unset on every public network. Must be
+     * positive and after EcashHeight so the original reset remains intact. */
+    std::optional<int> DAAHeight{};
     /**
      * Hashes of blocks that
      * - are known to be consensus valid, and

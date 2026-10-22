@@ -1,0 +1,350 @@
+diff --git a/contrib/ecash_functional.py b/contrib/ecash_functional.py
+new file mode 100644
+--- /dev/null
++++ b/contrib/ecash_functional.py
+@@ -0,0 +1,21 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The eCash developers
++# Distributed under the MIT software license, see COPYING.
++"""Run unchanged upstream tests against existing eCash config/magic/RPC rules."""
++import runpy
++import sys
++from pathlib import Path
++root=Path(__file__).resolve().parents[1]
++functional=root/'test/functional'
++sys.path.insert(0,str(functional))
++from test_framework.messages import MAGIC_BYTES
++from test_framework.test_node import TestNode
++MAGIC_BYTES.update(mainnet=bytes.fromhex('eca5dcb7'),testnet4=bytes.fromhex('eca5b124'),regtest=bytes.fromhex('eca5b134'))
++original=TestNode.__init__
++def init(self,*args,**kwargs):
++    original(self,*args,**kwargs)
++    self.args.extend(['-conf=bitcoin.conf','-deprecatedrpc=getblocktemplate'])
++TestNode.__init__=init
++target=functional/sys.argv.pop(1)
++sys.argv[0]=str(target)
++runpy.run_path(str(target),run_name='__main__')
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -123,6 +123,7 @@
+   policy/feerate.cpp
+   policy/policy.cpp
+   pow.cpp
++  daa.cpp
+   protocol.cpp
+   psbt.cpp
+   rpc/rawtransaction_util.cpp
+diff --git a/src/consensus/params.h b/src/consensus/params.h
+--- a/src/consensus/params.h
++++ b/src/consensus/params.h
+@@ -13,6 +13,7 @@
+ #include <chrono>
+ #include <limits>
+ #include <map>
++#include <optional>
+ #include <vector>
+ 
+ namespace Consensus {
+@@ -88,6 +89,9 @@
+     int EcashHeight{0};
+     /** Compact target the block at EcashHeight must carry. */
+     uint32_t EcashForkBits{0};
++    /** Experimental DAA activation, unset on every public network. Must be
++     * positive and after EcashHeight so the original reset remains intact. */
++    std::optional<int> DAAHeight{};
+     /**
+      * Hashes of blocks that
+      * - are known to be consensus valid, and
+diff --git a/src/daa.cpp b/src/daa.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/daa.cpp
+@@ -0,0 +1,56 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <daa.h>
++#include <daa_math.h>
++
++#include <algorithm>
++#include <cassert>
++
++namespace daa {
++bool Active(const Consensus::Params& params, int64_t height)
++{
++    assert(!params.DAAHeight || (*params.DAAHeight > 0 && *params.DAAHeight > params.EcashHeight));
++    return params.DAAHeight && height >= *params.DAAHeight;
++}
++
++bool Retarget(const Consensus::Params& params, int64_t height)
++{
++    return Active(params, height) && height > *params.DAAHeight && (height - *params.DAAHeight) % INTERVAL == 0;
++}
++
++arith_uint256 ScaleTarget(const arith_uint256& target, uint64_t numerator, uint64_t denominator, const arith_uint256& limit)
++{
++    assert(target != 0 && numerator != 0 && denominator != 0 && limit != 0);
++    const arith_uint256 factor{numerator}, divisor{denominator};
++    const arith_uint256 quotient = target / divisor;
++    // remainder < denominator <= 2^64-1, so remainder*factor fits 128 bits.
++    const arith_uint256 remainder = target - quotient * divisor;
++    const arith_uint256 tail = remainder * factor / divisor;
++    if (quotient > limit / factor) return limit;
++    arith_uint256 result = quotient * factor;
++    if (tail > limit - result) return limit;
++    result += tail;
++    return std::max(result, arith_uint256{1});
++}
++
++arith_uint256 ScaleTargetPow2(const arith_uint256& target, uint64_t factor, int64_t shift, const arith_uint256& limit)
++{
++    assert(target != 0 && factor != 0 && limit != 0);
++    // target*factor has at most 320 bits.
++    detail::Uint512 product{target};
++    product.Multiply(factor);
++    if (shift < 0) {
++        if (shift <= -512) return arith_uint256{1};
++        product.ShiftRight(static_cast<unsigned>(-shift));
++    }
++    if (!product.Fits256()) return limit;
++    arith_uint256 result = product.Low256();
++    if (shift > 0) {
++        if (shift >= 256 || result.bits() + shift > 256) return limit;
++        result <<= static_cast<unsigned>(shift);
++    }
++    return std::clamp(result, arith_uint256{1}, limit);
++}
++} // namespace daa
+diff --git a/src/daa.h b/src/daa.h
+new file mode 100644
+--- /dev/null
++++ b/src/daa.h
+@@ -0,0 +1,32 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_DAA_H
++#define BITCOIN_DAA_H
++
++#include <arith_uint256.h>
++#include <consensus/params.h>
++
++#include <cstdint>
++
++namespace daa {
++inline constexpr int64_t INTERVAL{144};
++inline constexpr int64_t SPACING{600};
++inline constexpr int64_t TIMESPAN{INTERVAL * SPACING};
++inline constexpr int64_t SMOOTHING{14};
++// Synthetic test height, unrelated to the still-unset public deployment height.
++inline constexpr int REGTEST_HEIGHT{200};
++
++bool Active(const Consensus::Params& params, int64_t height);
++bool Retarget(const Consensus::Params& params, int64_t height);
++
++/** Exact floor(target * numerator / denominator), saturated to [1, limit].
++ * No intermediate multiplication is allowed to wrap. Inputs must be positive. */
++arith_uint256 ScaleTarget(const arith_uint256& target, uint64_t numerator, uint64_t denominator, const arith_uint256& limit);
++
++/** Exact floor(target * factor * 2^shift), saturated to [1, limit]. */
++arith_uint256 ScaleTargetPow2(const arith_uint256& target, uint64_t factor, int64_t shift, const arith_uint256& limit);
++} // namespace daa
++
++#endif // BITCOIN_DAA_H
+diff --git a/src/daa_math.h b/src/daa_math.h
+new file mode 100644
+--- /dev/null
++++ b/src/daa_math.h
+@@ -0,0 +1,80 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_DAA_MATH_H
++#define BITCOIN_DAA_MATH_H
++
++#include <arith_uint256.h>
++
++#include <array>
++#include <cassert>
++#include <cstdint>
++
++namespace daa::detail {
++/** Local bounded intermediate, not a replacement for arith_uint256.
++ * Callers prove products fit 512 bits. Uses only standard 32/64-bit operations. */
++struct Uint512 {
++    std::array<uint32_t, 16> words{};
++
++    explicit Uint512(uint64_t value = 0) { words[0] = value; words[1] = value >> 32; }
++    explicit Uint512(arith_uint256 value)
++    {
++        for (size_t i = 0; i < 8; ++i, value >>= 32) words[i] = value.GetLow64();
++    }
++
++    void Multiply(uint64_t factor)
++    {
++        std::array<uint32_t, 16> result{};
++        for (size_t j = 0; j < 2; ++j) {
++            const uint32_t digit = factor >> (32 * j);
++            uint64_t carry{0};
++            for (size_t i = 0; i + j < words.size(); ++i) {
++                // (2^32-1)^2 + 2*(2^32-1) fits uint64_t exactly.
++                const uint64_t sum = uint64_t{words[i]} * digit + result[i + j] + carry;
++                result[i + j] = sum;
++                carry = sum >> 32;
++            }
++            assert(carry == 0);
++            if (j != 0) assert(words.back() == 0 || digit == 0);
++        }
++        words = result;
++    }
++
++    void ShiftRight(unsigned shift)
++    {
++        const auto original = words;
++        words.fill(0);
++        if (shift >= 512) return;
++        const size_t offset = shift / 32;
++        const unsigned bits = shift % 32;
++        for (size_t i = 0; i + offset < words.size(); ++i) {
++            words[i] = original[i + offset] >> bits;
++            if (bits != 0 && i + offset + 1 < words.size()) words[i] |= original[i + offset + 1] << (32 - bits);
++        }
++    }
++
++    bool Fits256() const
++    {
++        for (size_t i = 8; i < words.size(); ++i) if (words[i] != 0) return false;
++        return true;
++    }
++
++    arith_uint256 Low256() const
++    {
++        arith_uint256 result;
++        for (int i = 7; i >= 0; --i) { result <<= 32; result += words[i]; }
++        return result;
++    }
++
++    bool operator<=(const Uint512& other) const
++    {
++        for (int i = 15; i >= 0; --i) {
++            if (words[i] != other.words[i]) return words[i] < other.words[i];
++        }
++        return true;
++    }
++};
++} // namespace daa::detail
++
++#endif // BITCOIN_DAA_MATH_H
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -42,6 +42,7 @@
+   ../policy/settings.cpp
+   ../policy/truc_policy.cpp
+   ../pow.cpp
++  ../daa.cpp
+   ../primitives/block.cpp
+   ../primitives/transaction.cpp
+   ../pubkey.cpp
+diff --git a/src/pow.cpp b/src/pow.cpp
+--- a/src/pow.cpp
++++ b/src/pow.cpp
+@@ -92,6 +92,10 @@
+ // or decrease beyond the permitted limits.
+ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits)
+ {
++    // Full validation requires this reset even when it exceeds legacy bounds.
++    if (height == params.EcashHeight && params.EcashForkBits != 0)
++        return new_nbits == params.EcashForkBits && DeriveTarget(new_nbits, params.powLimit).has_value();
++
+     if (params.fPowAllowMinDifficultyBlocks) return true;
+ 
+     if (height % params.DifficultyAdjustmentInterval() == 0) {
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -39,6 +39,7 @@
+   crypto_tests.cpp
+   cuckoocache_tests.cpp
+   dbwrapper_tests.cpp
++  daa_common_tests.cpp
+   denialofservice_tests.cpp
+   descriptor_tests.cpp
+   disconnected_transactions.cpp
+diff --git a/src/test/daa_common_tests.cpp b/src/test/daa_common_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/test/daa_common_tests.cpp
+@@ -0,0 +1,68 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <chain.h>
++#include <chainparams.h>
++#include <daa.h>
++#include <pow.h>
++#include <test/util/setup_common.h>
++#include <util/chaintype.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <limits>
++#include <vector>
++
++BOOST_FIXTURE_TEST_SUITE(daa_common_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(disabled_public_parameters_and_independent_periods)
++{
++    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET, ChainType::REGTEST}) {
++        const auto p = CreateChainParams(*m_node.args, chain);
++        BOOST_CHECK(!p->GetConsensus().DAAHeight);
++        BOOST_CHECK(!daa::Active(p->GetConsensus(), std::numeric_limits<int>::max()));
++        BOOST_CHECK_EQUAL(p->GetConsensus().nPowTargetSpacing, 600);
++        BOOST_CHECK_EQUAL(p->GetConsensus().DifficultyAdjustmentInterval(), chain == ChainType::REGTEST ? 144 : 2016);
++        BOOST_CHECK_EQUAL(p->GetConsensus().vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period, chain == ChainType::REGTEST ? 144 : 2016);
++    }
++    auto p = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
++    p.DAAHeight = p.EcashHeight + 19;
++    const int h = *p.DAAHeight;
++    BOOST_CHECK(!daa::Active(p, h - 1));
++    BOOST_CHECK(daa::Active(p, h));
++    for (int n = h; n < h + 433; ++n) BOOST_CHECK_EQUAL(daa::Retarget(p, n), n > h && (n - h) % 144 == 0);
++}
++
++BOOST_AUTO_TEST_CASE(overflow_safe_scaling)
++{
++    const arith_uint256 maximum = ~arith_uint256{0};
++    BOOST_CHECK(daa::ScaleTarget(maximum, 1'335'506, 1'209'600, maximum) == maximum);
++    BOOST_CHECK(daa::ScaleTarget(maximum, 1'123'200, 1'209'600, maximum) == maximum / 14 * 13);
++    BOOST_CHECK(daa::ScaleTarget(arith_uint256{1}, 13, 14, maximum) == 1);
++    BOOST_CHECK(daa::ScaleTarget(maximum, UINT64_MAX, UINT64_MAX, maximum) == maximum);
++    BOOST_CHECK(daa::ScaleTargetPow2(maximum, UINT64_MAX, -64, maximum) == maximum - (maximum >> 64) - arith_uint256{1});
++    BOOST_CHECK(daa::ScaleTargetPow2(maximum, 2, -1, maximum) == maximum);
++    BOOST_CHECK(daa::ScaleTargetPow2(maximum, 1, -256, maximum) == 1);
++    BOOST_CHECK(daa::ScaleTargetPow2(arith_uint256{1}, 1, 256, maximum) == maximum);
++}
++
++BOOST_AUTO_TEST_CASE(ecash_reset_and_headers_admission)
++{
++    auto p = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
++    p.DAAHeight = p.EcashHeight + 10'000;
++    std::vector<CBlockIndex> blocks(2016);
++    for (int i = 0; i < 2016; ++i) {
++        blocks[i].nHeight = p.EcashHeight - 2016 + i;
++        blocks[i].pprev = i ? &blocks[i - 1] : nullptr;
++        blocks[i].nTime = 1'600'000'000 + i * 600;
++        blocks[i].nBits = 0x170fffff;
++    }
++    CBlockHeader candidate;
++    candidate.nTime = blocks.back().nTime + 600;
++    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks.back(), &candidate, p), p.EcashForkBits);
++    BOOST_CHECK(PermittedDifficultyTransition(p, p.EcashHeight, blocks.back().nBits, p.EcashForkBits));
++    BOOST_CHECK(!PermittedDifficultyTransition(p, p.EcashHeight, blocks.back().nBits, blocks.back().nBits));
++}
++
++BOOST_AUTO_TEST_SUITE_END()

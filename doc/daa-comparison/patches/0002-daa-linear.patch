@@ -1,0 +1,965 @@
+diff --git a/contrib/daa_reference.py b/contrib/daa_reference.py
+new file mode 100644
+--- /dev/null
++++ b/contrib/daa_reference.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The eCash developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Check the selected DAA specification against Decimal; regenerate C++ vectors."""
++import argparse
++from decimal import Decimal
++from pathlib import Path
++import random
++import sys
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0,str(ROOT/'test/functional'))
++from test_framework import daa  # noqa: E402
++
++
++def vector_inputs():
++    values = []
++    for bits in [0x207fffff,0x1c123456,0x01010000,0x02008000]:
++        for s in [-1000000,0,21599,21600,21601,43199,43200,86399,86400,86401,212305,212306,212307,345599,345600,345601,2**63-1,-2**63]:
++            values.append((bits,s,144))
++    rng = random.Random(973728)
++    for _ in range(120):
++        values.append((rng.choice([0x207fffff,0x1c123456]),rng.randrange(-3000000,10000000),rng.randrange(144,30000)))
++    for h in [0,1,144,288,100000,2147483647]:
++        values.extend((0x207fffff,600*h+e,h) for e in [-309657600,-1000000,-1,0,1,1000000,309657600])
++    return values
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--write-vectors',action='store_true')
++    args = parser.parse_args()
++    vectors = vector_inputs()
++    samples = list(vectors)
++    rng = random.Random(144)
++    samples.extend((rng.choice([0x207fffff,0x1c123456]),rng.randrange(-30000000,30000000),rng.randrange(144,40000)) for _ in range(2000))
++    for bits,s,h in samples:
++        actual = daa.integer_target(bits,s,h)
++        real = daa.real_target(bits,s,h)
++        # Separately account for the final integer floor. This checks arithmetic
++        # before compact encoding, whose mantissa would hide approximation error.
++        assert abs(Decimal(actual)-real) <= max(Decimal(1),real*Decimal('5e-10')), (bits,s,h)
++        assert daa.compact(int(daa.real_target(bits,s,h,precision=120))) == daa.compact(int(daa.real_target(bits,s,h,precision=170)))
++    # Seeded PoW waiting-time simulations: target feedback acts on block times,
++    # while the hashrate profile is external. This is a behavioral regression,
++    # not a miner-response or adversarial security proof.
++    simulation_retargets = 0
++    for profile in ('constant','step','oscillating'):
++        rng = random.Random(144)
++        bits, times = 0x1c123456, 1_600_000_000
++        anchor_bits, anchor_time = bits, times
++        history = [times-(10-i)*600 for i in range(11)]
++        boundary = history[5]
++        for period in range(42):
++            rate = 1 if profile == 'constant' else (2 if period >= 14 and period < 28 else 0.5) if profile == 'step' else (2 if period % 2 else 0.5)
++            for _ in range(144):
++                mean = 600*daa.decode(anchor_bits)/(rate*daa.decode(bits))
++                times += max(1,int(rng.expovariate(1/mean)))
++                history.append(times)
++            measured = times if daa.ALGORITHM == 'anchored' else sorted(history[-11:])[5]
++            delta, heights = (times-anchor_time,(period+1)*144) if daa.ALGORITHM == 'anchored' else (measured-boundary,144)
++            reference = anchor_bits if daa.ALGORITHM == 'anchored' else bits
++            value = daa.integer_target(reference,delta,heights)
++            real = daa.real_target(reference,delta,heights)
++            assert abs(Decimal(value)-real) <= max(Decimal(1),real*Decimal('5e-10'))
++            bits, boundary = daa.compact(value), measured
++            assert 0 < daa.decode(bits) <= daa.POW_LIMIT
++            simulation_retargets += 1
++    if args.write_vectors:
++        rows = []
++        for bits,s,h in vectors:
++            literal = 'std::numeric_limits<int64_t>::min()' if s == -2**63 else f'{s}LL'
++            rows.append(f'    {{0x{bits:08x}U, {literal}, {h}LL, 0x{daa.calculate(bits,s,h):08x}U}},')
++        text = '''// Generated from the independent Python integer specification; also checked
++// against a 120-digit Decimal oracle. Regenerate with contrib/daa_reference.py.
++#ifndef BITCOIN_TEST_DAA_VECTORS_H
++#define BITCOIN_TEST_DAA_VECTORS_H
++#include <cstdint>
++#include <limits>
++struct DAAVector { uint32_t bits; int64_t seconds; int64_t heights; uint32_t expected; };
++inline constexpr DAAVector DAA_VECTORS[]{
++'''+'\n'.join(rows)+'\n};\n'+f'inline constexpr bool DAA_ANCHORED{{{str(daa.ALGORITHM=="anchored").lower()}}};\ninline constexpr uint32_t DAA_FIRST_FAST_BITS{{0x{daa.calculate(0x207fffff,43200,144):08x}U}};\n#endif\n'
++        (ROOT/'src/test/daa_vectors.h').write_text(text)
++    print(f'{daa.ALGORITHM}: {len(samples)} high-precision checks passed; {len(vectors)} C++ vectors; {simulation_retargets} simulated retargets')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/doc/daa.md b/doc/daa.md
+new file mode 100644
+--- /dev/null
++++ b/doc/daa.md
+@@ -0,0 +1,27 @@
++**Experimental eCash DAA: linear**
++
++Apply the common foundation and this alternative only. This build has one compiled algorithm. No public network has an activation height; a future eCash height requires a separate deployment patch and agreement. The optional height must be positive and strictly later than EcashHeight. The original height-973728 reset remains in the legacy calculation and contextual validation. A narrow plausibility exception admits its prescribed bits even outside the legacy fourfold envelope.
++
++At H through H+143 carry H-1's bits, suppressing any intervening legacy retarget. Retarget at H+144 and then every 144 blocks. The first measurement spans H-1 through H+143; subsequent periods share their boundary block. Legacy target timespan, spacing, BIP9 periods, thresholds, timestamp validity, and public network identities are unchanged.
++
++The linearized partial target is floor(Q * (1123200 + clamp(s, 0, 212306)) / 1209600). Measure s using MTP at the shared boundaries. Rational scaling preserves the full product before division, using quotient and remainder to avoid overflow.
++
++Arithmetic saturates to [1,powLimit] before the existing compact encoding. Compact conversion rounds down again. Mathematical multiplier bounds and cancellation statements are subject to integer/fixed-point and compact quantization. Ratio/exponential approximation error is checked before compact encoding, separately allowing one target unit for the final floor. No floating-point computation is used in consensus.
++
++`-regtest -test=daa` is the isolated development mode. It uses synthetic H=200 and the algorithm in this source patch. It retains normal regtest before H; after H it ignores regtest's no-retarget and special minimum-difficulty escapes. Ordinary regtest is unchanged. `-test` is rejected on other networks by the existing startup checks. Combining DAA test mode with BIP94 is rejected. No public-testnet activation or minimum-difficulty interaction is specified by this experiment.
++
++Build and verify (replace python3 with a Python 3.10+ interpreter):
++
++```sh
++cmake -S . -B build -G Ninja -DBUILD_TESTS=ON -DENABLE_IPC=OFF -DENABLE_WALLET=OFF
++cmake --build build --target bitcoind bitcoin-cli test_bitcoin
++build/bin/test_bitcoin --run_test=daa_common_tests,daa_tests,pow_tests,headers_sync_chainwork_tests
++python3 contrib/daa_reference.py
++python3 test/functional/feature_daa.py --configfile=build/test/config.ini
++```
++
++`python3 contrib/daa_reference.py --write-vectors` regenerates the C++ vector header. The script checks 2234 inputs against a 120-digit Decimal oracle, confirms compact stability at 170 digits, and runs 126 retargets under seeded constant, step, and oscillating hashrate profiles. C++ checks exact bit outcomes, activation at and between old boundaries, raw time reversals, limits, extreme exponents, header admission, and both headers-sync phases. The functional test mines four retarget periods, checks template/header/block bits, synchronizes from genesis, verifies ordinary regtest, replaces the activation anchor in a reorganization, and restarts.
++
++For unchanged Core functional regressions on this eCash base, run `python3 contrib/ecash_functional.py mining_basic.py --configfile=build/test/config.ini` (substitute other scripts as needed). This test-only adapter supplies the existing eCash magic and configuration filename and enables the base fork's documented deprecated mining RPC escape for tests. It changes no node consensus or network identity and avoids modifying upstream test files.
++
++MTP manipulation, clipping, and recursive path dependence remain concerns for the partial retargets. Anchored exponential avoids recursive estimator drift but retains raw timestamp influence and an anchor that can differ on a reorganization. Simulations are behavioral checks, not stability or adversarial security proofs. Deploying this code remains a separate consensus decision.
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -124,6 +124,7 @@
+   policy/policy.cpp
+   pow.cpp
+   daa.cpp
++  daa_algorithm.cpp
+   protocol.cpp
+   psbt.cpp
+   rpc/rawtransaction_util.cpp
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -45,6 +45,7 @@
+ {
+     if (auto value = args.GetBoolArg("-fastprune")) options.fastprune = *value;
+     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
++    if (HasTestOption(args, "daa")) options.test_daa = true;
+ 
+     for (const std::string& arg : args.GetArgs("-testactivationheight")) {
+         const auto found{arg.find('@')};
+diff --git a/src/common/args.cpp b/src/common/args.cpp
+--- a/src/common/args.cpp
++++ b/src/common/args.cpp
+@@ -744,6 +744,7 @@
+     "addrman (use deterministic addrman)",
+     "reindex_after_failure_noninteractive_yes (When asked for a reindex after failure interactively, simulate as-if answered with 'yes')",
+     "bip94 (enforce BIP94 consensus rules)",
++    "daa (enable this build's experimental DAA at synthetic regtest height 200)",
+ };
+ 
+ bool HasTestOption(const ArgsManager& args, const std::string& test_option)
+diff --git a/src/daa_algorithm.cpp b/src/daa_algorithm.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/daa_algorithm.cpp
+@@ -0,0 +1,46 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <daa_algorithm.h>
++#include <chain.h>
++#include <pow.h>
++#include <util/check.h>
++
++#include <algorithm>
++#include <cassert>
++#include <limits>
++
++namespace daa {
++namespace {
++constexpr int64_t MIN_SPAN{0}, MAX_SPAN{212306};
++} // namespace
++
++uint32_t CalculateTarget(uint32_t reference_bits, int64_t time_delta, int64_t /*height_delta*/, const uint256& pow_limit)
++{
++    const auto target = *Assert(DeriveTarget(reference_bits, pow_limit));
++    const auto elapsed = std::clamp(time_delta, MIN_SPAN, MAX_SPAN);
++    return ScaleTarget(target, (SMOOTHING - 1) * TIMESPAN + elapsed, SMOOTHING * TIMESPAN, UintToArith256(pow_limit)).GetCompact();
++}
++
++uint32_t GetWorkRequired(const CBlockIndex& last, const Consensus::Params& params)
++{
++    const int64_t next = int64_t{last.nHeight} + 1;
++    assert(Active(params, next));
++    if (!Retarget(params, next)) return last.nBits;
++    // Reuse the previous boundary, not the first block of this period.
++    const auto* first = Assert(last.GetAncestor(last.nHeight - INTERVAL));
++    return CalculateTarget(last.nBits, last.GetMedianTimePast() - first->GetMedianTimePast(), INTERVAL, params.powLimit);
++}
++
++bool PermittedTransition(const Consensus::Params& params, int64_t height, uint32_t old_bits, uint32_t new_bits)
++{
++    const auto old_target = DeriveTarget(old_bits, params.powLimit);
++    const auto new_target = DeriveTarget(new_bits, params.powLimit);
++    if (!old_target || !new_target) return false;
++    if (!Retarget(params, height)) return old_bits == new_bits;
++    const auto minimum = *Assert(DeriveTarget(CalculateTarget(old_bits, MIN_SPAN, INTERVAL, params.powLimit), params.powLimit));
++    const auto maximum = *Assert(DeriveTarget(CalculateTarget(old_bits, MAX_SPAN, INTERVAL, params.powLimit), params.powLimit));
++    return *new_target >= minimum && *new_target <= maximum;
++}
++} // namespace daa
+diff --git a/src/daa_algorithm.h b/src/daa_algorithm.h
+new file mode 100644
+--- /dev/null
++++ b/src/daa_algorithm.h
+@@ -0,0 +1,21 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_DAA_ALGORITHM_H
++#define BITCOIN_DAA_ALGORITHM_H
++
++#include <daa.h>
++
++class CBlockIndex;
++
++namespace daa {
++/** reference_bits is the preceding target for partial retargets, or the fixed
++ * anchor target for anchored exponential. height_delta is relative to that
++ * anchor (144 for a partial retarget). Inputs come from validated ancestors. */
++uint32_t CalculateTarget(uint32_t reference_bits, int64_t time_delta, int64_t height_delta, const uint256& pow_limit);
++uint32_t GetWorkRequired(const CBlockIndex& last, const Consensus::Params& params);
++bool PermittedTransition(const Consensus::Params& params, int64_t height, uint32_t old_bits, uint32_t new_bits);
++} // namespace daa
++
++#endif // BITCOIN_DAA_ALGORITHM_H
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -43,6 +43,7 @@
+   ../policy/truc_policy.cpp
+   ../pow.cpp
+   ../daa.cpp
++  ../daa_algorithm.cpp
+   ../primitives/block.cpp
+   ../primitives/transaction.cpp
+   ../pubkey.cpp
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -9,6 +9,7 @@
+ #include <consensus/amount.h>
+ #include <consensus/merkle.h>
+ #include <consensus/params.h>
++#include <daa.h>
+ #include <crypto/hex_base.h>
+ #include <hash.h>
+ #include <kernel/messagestartchars.h>
+@@ -600,6 +601,12 @@
+         consensus.fPowAllowMinDifficultyBlocks = true;
+         consensus.enforce_BIP94 = opts.enforce_bip94;
+         consensus.fPowNoRetargeting = true;
++        // Explicit test mode only. Standard regtest keeps all legacy behavior;
++        // in test mode the active DAA ignores no-retarget/min-difficulty escapes.
++        if (opts.test_daa) {
++            if (opts.enforce_bip94) throw std::invalid_argument("DAA test mode cannot be combined with BIP94");
++            consensus.DAAHeight = daa::REGTEST_HEIGHT;
++        }
+ 
+         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
+         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
+diff --git a/src/kernel/chainparams.h b/src/kernel/chainparams.h
+--- a/src/kernel/chainparams.h
++++ b/src/kernel/chainparams.h
+@@ -152,6 +152,7 @@
+         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
+         bool fastprune{false};
+         bool enforce_bip94{false};
++        bool test_daa{false};
+     };
+ 
+     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);
+diff --git a/src/pow.cpp b/src/pow.cpp
+--- a/src/pow.cpp
++++ b/src/pow.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <arith_uint256.h>
+ #include <chain.h>
++#include <daa_algorithm.h>
+ #include <primitives/block.h>
+ #include <uint256.h>
+ #include <util/check.h>
+@@ -14,6 +15,8 @@
+ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
+ {
+     assert(pindexLast != nullptr);
++    if (daa::Active(params, int64_t{pindexLast->nHeight} + 1))
++        return daa::GetWorkRequired(*pindexLast, params);
+     unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
+ 
+     // Only change once per difficulty adjustment interval
+@@ -96,6 +99,9 @@
+     if (height == params.EcashHeight && params.EcashForkBits != 0)
+         return new_nbits == params.EcashForkBits && DeriveTarget(new_nbits, params.powLimit).has_value();
+ 
++    if (daa::Active(params, height))
++        return daa::PermittedTransition(params, height, old_nbits, new_nbits);
++
+     if (params.fPowAllowMinDifficultyBlocks) return true;
+ 
+     if (height % params.DifficultyAdjustmentInterval() == 0) {
+diff --git a/src/pow.h b/src/pow.h
+--- a/src/pow.h
++++ b/src/pow.h
+@@ -38,11 +38,13 @@
+  * given height is not possible, given the proof-of-work on the prior block as
+  * specified by old_nbits.
+  *
+- * This function only checks that the new value is within a factor of 4 of the
++ * Before experimental DAA activation, this function checks a factor of 4 of the
+  * old value for blocks at the difficulty adjustment interval, and otherwise
+- * requires the values to be the same.
++ * requires the values to be the same, except for the prescribed eCash reset.
++ * The experimental regime uses its own schedule and algorithm bounds. An
++ * unbounded anchored transition needs additional anchor context in headerssync.
+  *
+- * Always returns true on networks where min difficulty blocks are allowed,
++ * Before activation, returns true on networks where min difficulty blocks are allowed,
+  * such as regtest/testnet.
+  */
+ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits);
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -40,6 +40,7 @@
+   cuckoocache_tests.cpp
+   dbwrapper_tests.cpp
+   daa_common_tests.cpp
++  daa_tests.cpp
+   denialofservice_tests.cpp
+   descriptor_tests.cpp
+   disconnected_transactions.cpp
+diff --git a/src/test/daa_tests.cpp b/src/test/daa_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/test/daa_tests.cpp
+@@ -0,0 +1,141 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <chain.h>
++#include <chainparams.h>
++#include <daa_algorithm.h>
++#include <headerssync.h>
++#include <pow.h>
++#include <test/daa_vectors.h>
++#include <test/util/setup_common.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <span>
++#include <vector>
++
++namespace {
++struct Chain {
++    std::vector<CBlockIndex> blocks;
++    std::vector<uint256> hashes;
++    std::vector<CBlockHeader> headers;
++    Chain(const Consensus::Params& params, int count, int spacing) : blocks(count), hashes(count), headers(count)
++    {
++        for (int i = 0; i < count; ++i) {
++            auto& b = blocks[i];
++            b.nHeight = i;
++            b.nVersion = 4;
++            b.pprev = i ? &blocks[i-1] : nullptr;
++            b.nTime = 1'600'000'000 + i*spacing;
++            CBlockHeader candidate;
++            candidate.nTime = b.nTime;
++            b.nBits = i ? GetNextWorkRequired(b.pprev, &candidate, params) : 0x207fffff;
++            b.nChainWork = (i ? blocks[i-1].nChainWork : arith_uint256{0}) + GetBlockProof(b);
++            b.BuildSkip();
++            hashes[i] = b.GetBlockHeader().GetHash();
++            b.phashBlock = &hashes[i];
++            headers[i] = b.GetBlockHeader();
++        }
++    }
++};
++Consensus::Params TestParams(int height = daa::REGTEST_HEIGHT)
++{
++    CChainParams::RegTestOptions opts;
++    opts.test_daa = true;
++    auto params = CChainParams::RegTest(opts)->GetConsensus();
++    params.DAAHeight = height;
++    return params;
++}
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(daa_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(deterministic_reference_vectors)
++{
++    const auto params = TestParams();
++    for (const auto& v : DAA_VECTORS) {
++        BOOST_TEST_CONTEXT("bits=" << v.bits << " seconds=" << v.seconds << " heights=" << v.heights) {
++            BOOST_CHECK_EQUAL(daa::CalculateTarget(v.bits, v.seconds, v.heights, params.powLimit), v.expected);
++            BOOST_CHECK(DeriveTarget(v.expected, params.powLimit));
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(activation_and_exact_intervals)
++{
++    for (const int h : {200, 288, 2016}) {
++        const auto params = TestParams(h);
++        Chain c{params, h+290, 300};
++        for (int n = 0; n < h+144; ++n) BOOST_CHECK_EQUAL(c.blocks[n].nBits, 0x207fffff);
++        BOOST_CHECK_EQUAL(c.blocks[h+144].nBits, DAA_FIRST_FAST_BITS);
++        for (int n = h+145; n < h+288; ++n) BOOST_CHECK_EQUAL(c.blocks[n].nBits, DAA_FIRST_FAST_BITS);
++        const uint32_t second = DAA_ANCHORED
++            ? daa::CalculateTarget(0x207fffff, 86400, 288, params.powLimit)
++            : daa::CalculateTarget(DAA_FIRST_FAST_BITS, 43200, 144, params.powLimit);
++        BOOST_CHECK_EQUAL(c.blocks[h+288].nBits, second);
++        // A valid nonmonotonic boundary header: median is unchanged.
++        auto& last = c.blocks[h+143];
++        const auto median = last.GetMedianTimePast();
++        last.nTime -= 400;
++        BOOST_CHECK_LT(last.nTime, last.pprev->nTime);
++        BOOST_CHECK_GT(last.GetBlockTime(), last.pprev->GetMedianTimePast());
++        BOOST_CHECK_EQUAL(last.GetMedianTimePast(), median);
++        const uint32_t expected = DAA_ANCHORED
++            ? daa::CalculateTarget(0x207fffff, 43200-400, 144, params.powLimit)
++            : DAA_FIRST_FAST_BITS;
++        BOOST_CHECK_EQUAL(daa::GetWorkRequired(last, params), expected);
++        if (DAA_ANCHORED) {
++            // Replacing the anchor on another ancestry must change the result.
++            c.blocks[h-1].nTime += 1000;
++            BOOST_CHECK_EQUAL(daa::GetWorkRequired(last, params), daa::CalculateTarget(0x207fffff, 43200-1400, 144, params.powLimit));
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(transition_checks_and_regtest_escape_is_disabled)
++{
++    const auto params = TestParams();
++    Chain c{params, 345, 300};
++    CBlockHeader late;
++    late.nTime = c.blocks[344].nTime + 100'000;
++    BOOST_CHECK_EQUAL(GetNextWorkRequired(&c.blocks[344], &late, params), c.blocks[344].nBits);
++    BOOST_CHECK(PermittedDifficultyTransition(params, 344, c.blocks[343].nBits, c.blocks[344].nBits));
++    BOOST_CHECK(!PermittedDifficultyTransition(params, 288, c.blocks[287].nBits, c.blocks[287].nBits-1));
++    for (uint32_t invalid : {0U, 0x20800001U, 0x23000001U, 0x2100ffffU})
++        BOOST_CHECK(!PermittedDifficultyTransition(params, 344, c.blocks[343].nBits, invalid));
++    if (DAA_ANCHORED) {
++        // This real anchored transition is far beyond the old fourfold limit.
++        const uint32_t harder = daa::CalculateTarget(0x207fffff, 0, 5000, params.powLimit);
++        BOOST_CHECK(PermittedDifficultyTransition(params, 344, 0x207fffff, harder));
++    } else {
++        BOOST_CHECK(!PermittedDifficultyTransition(params, 344, 0x207fffff, 0x200fffff));
++    }
++}
++
++BOOST_AUTO_TEST_CASE(headers_presync_and_redownload_across_activation)
++{
++    const auto params = TestParams();
++    Chain c{params, 701, 300};
++    for (const int start : {0, 400}) {
++        HeadersSyncState state{0, params, HeadersSyncParams{17, 32}, c.blocks[start], c.blocks.back().nChainWork};
++        const auto headers = std::span{c.headers}.subspan(start+1);
++        const auto first = state.ProcessNextHeaders(headers, true);
++        BOOST_REQUIRE(first.success);
++        BOOST_REQUIRE(state.GetState() == HeadersSyncState::State::REDOWNLOAD);
++        const auto second = state.ProcessNextHeaders(headers, true);
++        BOOST_REQUIRE(second.success);
++        BOOST_CHECK_EQUAL(second.pow_validated_headers.size(), headers.size());
++    }
++    if (DAA_ANCHORED) {
++        auto bad = c.headers;
++        bad[344].nBits -= 1; // valid target, wrong anchored result
++        HeadersSyncState presync{0, params, HeadersSyncParams{17,32}, c.blocks[0], c.blocks.back().nChainWork};
++        BOOST_CHECK(!presync.ProcessNextHeaders(std::span{bad}.subspan(1), true).success);
++        HeadersSyncState redownload{0, params, HeadersSyncParams{17,32}, c.blocks[0], c.blocks.back().nChainWork};
++        BOOST_REQUIRE(redownload.ProcessNextHeaders(std::span{c.headers}.subspan(1), true).success);
++        BOOST_CHECK(!redownload.ProcessNextHeaders(std::span{bad}.subspan(1), true).success);
++    }
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/daa_vectors.h b/src/test/daa_vectors.h
+new file mode 100644
+--- /dev/null
++++ b/src/test/daa_vectors.h
+@@ -0,0 +1,246 @@
++// Generated from the independent Python integer specification; also checked
++// against a 120-digit Decimal oracle. Regenerate with contrib/daa_reference.py.
++#ifndef BITCOIN_TEST_DAA_VECTORS_H
++#define BITCOIN_TEST_DAA_VECTORS_H
++#include <cstdint>
++#include <limits>
++struct DAAVector { uint32_t bits; int64_t seconds; int64_t heights; uint32_t expected; };
++inline constexpr DAAVector DAA_VECTORS[]{
++    {0x207fffffU, -1000000LL, 144LL, 0x2076db6cU},
++    {0x207fffffU, 0LL, 144LL, 0x2076db6cU},
++    {0x207fffffU, 21599LL, 144LL, 0x2079248aU},
++    {0x207fffffU, 21600LL, 144LL, 0x20792491U},
++    {0x207fffffU, 21601LL, 144LL, 0x20792498U},
++    {0x207fffffU, 43199LL, 144LL, 0x207b6daeU},
++    {0x207fffffU, 43200LL, 144LL, 0x207b6db5U},
++    {0x207fffffU, 86399LL, 144LL, 0x207ffff8U},
++    {0x207fffffU, 86400LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 86401LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 212305LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 212306LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 212307LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 345599LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 345600LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 345601LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 9223372036854775807LL, 144LL, 0x207fffffU},
++    {0x207fffffU, std::numeric_limits<int64_t>::min(), 144LL, 0x2076db6cU},
++    {0x1c123456U, -1000000LL, 144LL, 0x1c10e774U},
++    {0x1c123456U, 0LL, 144LL, 0x1c10e774U},
++    {0x1c123456U, 21599LL, 144LL, 0x1c113aabU},
++    {0x1c123456U, 21600LL, 144LL, 0x1c113aacU},
++    {0x1c123456U, 21601LL, 144LL, 0x1c113aadU},
++    {0x1c123456U, 43199LL, 144LL, 0x1c118de4U},
++    {0x1c123456U, 43200LL, 144LL, 0x1c118de5U},
++    {0x1c123456U, 86399LL, 144LL, 0x1c123455U},
++    {0x1c123456U, 86400LL, 144LL, 0x1c123456U},
++    {0x1c123456U, 86401LL, 144LL, 0x1c123456U},
++    {0x1c123456U, 212305LL, 144LL, 0x1c14196bU},
++    {0x1c123456U, 212306LL, 144LL, 0x1c14196cU},
++    {0x1c123456U, 212307LL, 144LL, 0x1c14196cU},
++    {0x1c123456U, 345599LL, 144LL, 0x1c14196cU},
++    {0x1c123456U, 345600LL, 144LL, 0x1c14196cU},
++    {0x1c123456U, 345601LL, 144LL, 0x1c14196cU},
++    {0x1c123456U, 9223372036854775807LL, 144LL, 0x1c14196cU},
++    {0x1c123456U, std::numeric_limits<int64_t>::min(), 144LL, 0x1c10e774U},
++    {0x01010000U, -1000000LL, 144LL, 0x01010000U},
++    {0x01010000U, 0LL, 144LL, 0x01010000U},
++    {0x01010000U, 21599LL, 144LL, 0x01010000U},
++    {0x01010000U, 21600LL, 144LL, 0x01010000U},
++    {0x01010000U, 21601LL, 144LL, 0x01010000U},
++    {0x01010000U, 43199LL, 144LL, 0x01010000U},
++    {0x01010000U, 43200LL, 144LL, 0x01010000U},
++    {0x01010000U, 86399LL, 144LL, 0x01010000U},
++    {0x01010000U, 86400LL, 144LL, 0x01010000U},
++    {0x01010000U, 86401LL, 144LL, 0x01010000U},
++    {0x01010000U, 212305LL, 144LL, 0x01010000U},
++    {0x01010000U, 212306LL, 144LL, 0x01010000U},
++    {0x01010000U, 212307LL, 144LL, 0x01010000U},
++    {0x01010000U, 345599LL, 144LL, 0x01010000U},
++    {0x01010000U, 345600LL, 144LL, 0x01010000U},
++    {0x01010000U, 345601LL, 144LL, 0x01010000U},
++    {0x01010000U, 9223372036854775807LL, 144LL, 0x01010000U},
++    {0x01010000U, std::numeric_limits<int64_t>::min(), 144LL, 0x01010000U},
++    {0x02008000U, -1000000LL, 144LL, 0x01760000U},
++    {0x02008000U, 0LL, 144LL, 0x01760000U},
++    {0x02008000U, 21599LL, 144LL, 0x01790000U},
++    {0x02008000U, 21600LL, 144LL, 0x01790000U},
++    {0x02008000U, 21601LL, 144LL, 0x01790000U},
++    {0x02008000U, 43199LL, 144LL, 0x017b0000U},
++    {0x02008000U, 43200LL, 144LL, 0x017b0000U},
++    {0x02008000U, 86399LL, 144LL, 0x017f0000U},
++    {0x02008000U, 86400LL, 144LL, 0x02008000U},
++    {0x02008000U, 86401LL, 144LL, 0x02008000U},
++    {0x02008000U, 212305LL, 144LL, 0x02008d00U},
++    {0x02008000U, 212306LL, 144LL, 0x02008d00U},
++    {0x02008000U, 212307LL, 144LL, 0x02008d00U},
++    {0x02008000U, 345599LL, 144LL, 0x02008d00U},
++    {0x02008000U, 345600LL, 144LL, 0x02008d00U},
++    {0x02008000U, 345601LL, 144LL, 0x02008d00U},
++    {0x02008000U, 9223372036854775807LL, 144LL, 0x02008d00U},
++    {0x02008000U, std::numeric_limits<int64_t>::min(), 144LL, 0x01760000U},
++    {0x207fffffU, 6085994LL, 22524LL, 0x207fffffU},
++    {0x207fffffU, 7835665LL, 14874LL, 0x207fffffU},
++    {0x207fffffU, 8444387LL, 7933LL, 0x207fffffU},
++    {0x207fffffU, 3049289LL, 12742LL, 0x207fffffU},
++    {0x1c123456U, 7153782LL, 29821LL, 0x1c14196cU},
++    {0x207fffffU, 1788376LL, 9375LL, 0x207fffffU},
++    {0x1c123456U, 8366484LL, 5487LL, 0x1c14196cU},
++    {0x207fffffU, 718777LL, 24624LL, 0x207fffffU},
++    {0x207fffffU, 5813621LL, 21180LL, 0x207fffffU},
++    {0x207fffffU, 6120729LL, 29139LL, 0x207fffffU},
++    {0x1c123456U, -1350946LL, 6637LL, 0x1c10e774U},
++    {0x1c123456U, 9513949LL, 20128LL, 0x1c14196cU},
++    {0x1c123456U, -867411LL, 7976LL, 0x1c10e774U},
++    {0x1c123456U, 8832279LL, 5557LL, 0x1c14196cU},
++    {0x207fffffU, 2175907LL, 23221LL, 0x207fffffU},
++    {0x1c123456U, -357394LL, 9741LL, 0x1c10e774U},
++    {0x1c123456U, 1109592LL, 12812LL, 0x1c14196cU},
++    {0x207fffffU, 6402068LL, 10717LL, 0x207fffffU},
++    {0x207fffffU, 9278061LL, 8054LL, 0x207fffffU},
++    {0x207fffffU, -2476518LL, 15584LL, 0x2076db6cU},
++    {0x1c123456U, -2021472LL, 17359LL, 0x1c10e774U},
++    {0x207fffffU, 3930815LL, 10902LL, 0x207fffffU},
++    {0x1c123456U, 2000399LL, 29858LL, 0x1c14196cU},
++    {0x1c123456U, 2097675LL, 20804LL, 0x1c14196cU},
++    {0x207fffffU, 8511522LL, 5323LL, 0x207fffffU},
++    {0x1c123456U, 6607681LL, 1081LL, 0x1c14196cU},
++    {0x1c123456U, -138551LL, 19396LL, 0x1c10e774U},
++    {0x1c123456U, 1470902LL, 14083LL, 0x1c14196cU},
++    {0x207fffffU, 4076375LL, 11876LL, 0x207fffffU},
++    {0x207fffffU, -2372503LL, 8275LL, 0x2076db6cU},
++    {0x207fffffU, 2300458LL, 26707LL, 0x207fffffU},
++    {0x1c123456U, 9528257LL, 20130LL, 0x1c14196cU},
++    {0x207fffffU, -1863958LL, 16667LL, 0x2076db6cU},
++    {0x207fffffU, 9617936LL, 8291LL, 0x207fffffU},
++    {0x1c123456U, 3217038LL, 7402LL, 0x1c14196cU},
++    {0x207fffffU, 944895LL, 19937LL, 0x207fffffU},
++    {0x1c123456U, -1920979LL, 3173LL, 0x1c10e774U},
++    {0x207fffffU, 2402101LL, 7517LL, 0x207fffffU},
++    {0x207fffffU, -2733987LL, 2932LL, 0x2076db6cU},
++    {0x207fffffU, 5071272LL, 12118LL, 0x207fffffU},
++    {0x207fffffU, 8281351LL, 23833LL, 0x207fffffU},
++    {0x1c123456U, -2302858LL, 5255LL, 0x1c10e774U},
++    {0x1c123456U, -172331LL, 16568LL, 0x1c10e774U},
++    {0x1c123456U, 4277783LL, 2026LL, 0x1c14196cU},
++    {0x1c123456U, 6187771LL, 24243LL, 0x1c14196cU},
++    {0x1c123456U, 5169952LL, 14337LL, 0x1c14196cU},
++    {0x1c123456U, 1845703LL, 9387LL, 0x1c14196cU},
++    {0x1c123456U, -1795459LL, 25815LL, 0x1c10e774U},
++    {0x207fffffU, 6694396LL, 26243LL, 0x207fffffU},
++    {0x1c123456U, -354315LL, 9422LL, 0x1c10e774U},
++    {0x207fffffU, 3910624LL, 843LL, 0x207fffffU},
++    {0x207fffffU, 8853182LL, 2450LL, 0x207fffffU},
++    {0x207fffffU, 4474979LL, 10853LL, 0x207fffffU},
++    {0x207fffffU, 9140583LL, 12157LL, 0x207fffffU},
++    {0x207fffffU, -1246993LL, 3771LL, 0x2076db6cU},
++    {0x1c123456U, 9376729LL, 6121LL, 0x1c14196cU},
++    {0x1c123456U, -244965LL, 9277LL, 0x1c10e774U},
++    {0x207fffffU, -1387633LL, 20852LL, 0x2076db6cU},
++    {0x207fffffU, 1496826LL, 29730LL, 0x207fffffU},
++    {0x207fffffU, 1388621LL, 3154LL, 0x207fffffU},
++    {0x1c123456U, -1976852LL, 26454LL, 0x1c10e774U},
++    {0x207fffffU, 9289134LL, 17952LL, 0x207fffffU},
++    {0x1c123456U, 7789782LL, 22192LL, 0x1c14196cU},
++    {0x1c123456U, 873341LL, 24085LL, 0x1c14196cU},
++    {0x1c123456U, -2608272LL, 26223LL, 0x1c10e774U},
++    {0x1c123456U, 6034765LL, 6915LL, 0x1c14196cU},
++    {0x207fffffU, 3218257LL, 26951LL, 0x207fffffU},
++    {0x207fffffU, -2585569LL, 15263LL, 0x2076db6cU},
++    {0x207fffffU, -883444LL, 10600LL, 0x2076db6cU},
++    {0x207fffffU, 3826499LL, 10883LL, 0x207fffffU},
++    {0x207fffffU, 6151623LL, 12550LL, 0x207fffffU},
++    {0x1c123456U, 9329388LL, 22712LL, 0x1c14196cU},
++    {0x1c123456U, 8514107LL, 889LL, 0x1c14196cU},
++    {0x1c123456U, 2264985LL, 22496LL, 0x1c14196cU},
++    {0x207fffffU, 1254156LL, 5783LL, 0x207fffffU},
++    {0x207fffffU, 3414917LL, 28485LL, 0x207fffffU},
++    {0x1c123456U, 6896260LL, 27174LL, 0x1c14196cU},
++    {0x207fffffU, -1883025LL, 3356LL, 0x2076db6cU},
++    {0x207fffffU, 4358920LL, 12840LL, 0x207fffffU},
++    {0x207fffffU, -1183603LL, 5410LL, 0x2076db6cU},
++    {0x1c123456U, -2561745LL, 11861LL, 0x1c10e774U},
++    {0x207fffffU, -1417780LL, 16438LL, 0x2076db6cU},
++    {0x1c123456U, 8375959LL, 14651LL, 0x1c14196cU},
++    {0x207fffffU, 6727515LL, 19063LL, 0x207fffffU},
++    {0x1c123456U, 4695841LL, 26132LL, 0x1c14196cU},
++    {0x207fffffU, 1254420LL, 26241LL, 0x207fffffU},
++    {0x207fffffU, -2566828LL, 27725LL, 0x2076db6cU},
++    {0x207fffffU, -837830LL, 28803LL, 0x2076db6cU},
++    {0x207fffffU, 7046972LL, 28602LL, 0x207fffffU},
++    {0x207fffffU, 8418535LL, 7980LL, 0x207fffffU},
++    {0x1c123456U, 8485627LL, 25074LL, 0x1c14196cU},
++    {0x1c123456U, -2870185LL, 3484LL, 0x1c10e774U},
++    {0x207fffffU, 41445LL, 25538LL, 0x207b3e2aU},
++    {0x207fffffU, 7340249LL, 10396LL, 0x207fffffU},
++    {0x207fffffU, -1602372LL, 22684LL, 0x2076db6cU},
++    {0x207fffffU, 2026589LL, 27009LL, 0x207fffffU},
++    {0x207fffffU, 2372067LL, 12697LL, 0x207fffffU},
++    {0x1c123456U, 5221240LL, 29126LL, 0x1c14196cU},
++    {0x207fffffU, 5490898LL, 4532LL, 0x207fffffU},
++    {0x1c123456U, 20540LL, 5378LL, 0x1c113697U},
++    {0x207fffffU, 3458917LL, 24801LL, 0x207fffffU},
++    {0x207fffffU, 6806837LL, 15356LL, 0x207fffffU},
++    {0x1c123456U, 9646400LL, 25277LL, 0x1c14196cU},
++    {0x1c123456U, 7730599LL, 20750LL, 0x1c14196cU},
++    {0x1c123456U, 2569944LL, 14821LL, 0x1c14196cU},
++    {0x1c123456U, 2234178LL, 20135LL, 0x1c14196cU},
++    {0x207fffffU, 9678170LL, 26838LL, 0x207fffffU},
++    {0x1c123456U, 2961248LL, 6593LL, 0x1c14196cU},
++    {0x1c123456U, 1735444LL, 3030LL, 0x1c14196cU},
++    {0x1c123456U, 8749713LL, 7063LL, 0x1c14196cU},
++    {0x207fffffU, 6804712LL, 29516LL, 0x207fffffU},
++    {0x1c123456U, 9482852LL, 13162LL, 0x1c14196cU},
++    {0x207fffffU, 6968670LL, 13578LL, 0x207fffffU},
++    {0x1c123456U, 6823675LL, 21842LL, 0x1c14196cU},
++    {0x207fffffU, 9133298LL, 24708LL, 0x207fffffU},
++    {0x207fffffU, 9548396LL, 10524LL, 0x207fffffU},
++    {0x1c123456U, 9119967LL, 8597LL, 0x1c14196cU},
++    {0x207fffffU, 7733022LL, 11307LL, 0x207fffffU},
++    {0x1c123456U, 296315LL, 21541LL, 0x1c14196cU},
++    {0x1c123456U, 3300742LL, 19930LL, 0x1c14196cU},
++    {0x207fffffU, -309657600LL, 0LL, 0x2076db6cU},
++    {0x207fffffU, -1000000LL, 0LL, 0x2076db6cU},
++    {0x207fffffU, -1LL, 0LL, 0x2076db6cU},
++    {0x207fffffU, 0LL, 0LL, 0x2076db6cU},
++    {0x207fffffU, 1LL, 0LL, 0x2076db73U},
++    {0x207fffffU, 1000000LL, 0LL, 0x207fffffU},
++    {0x207fffffU, 309657600LL, 0LL, 0x207fffffU},
++    {0x207fffffU, -309657000LL, 1LL, 0x2076db6cU},
++    {0x207fffffU, -999400LL, 1LL, 0x2076db6cU},
++    {0x207fffffU, 599LL, 1LL, 0x2076eba6U},
++    {0x207fffffU, 600LL, 1LL, 0x2076ebadU},
++    {0x207fffffU, 601LL, 1LL, 0x2076ebb4U},
++    {0x207fffffU, 1000600LL, 1LL, 0x207fffffU},
++    {0x207fffffU, 309658200LL, 1LL, 0x207fffffU},
++    {0x207fffffU, -309571200LL, 144LL, 0x2076db6cU},
++    {0x207fffffU, -913600LL, 144LL, 0x2076db6cU},
++    {0x207fffffU, 86399LL, 144LL, 0x207ffff8U},
++    {0x207fffffU, 86400LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 86401LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 1086400LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 309744000LL, 144LL, 0x207fffffU},
++    {0x207fffffU, -309484800LL, 288LL, 0x2076db6cU},
++    {0x207fffffU, -827200LL, 288LL, 0x2076db6cU},
++    {0x207fffffU, 172799LL, 288LL, 0x207fffffU},
++    {0x207fffffU, 172800LL, 288LL, 0x207fffffU},
++    {0x207fffffU, 172801LL, 288LL, 0x207fffffU},
++    {0x207fffffU, 1172800LL, 288LL, 0x207fffffU},
++    {0x207fffffU, 309830400LL, 288LL, 0x207fffffU},
++    {0x207fffffU, -249657600LL, 100000LL, 0x2076db6cU},
++    {0x207fffffU, 59000000LL, 100000LL, 0x207fffffU},
++    {0x207fffffU, 59999999LL, 100000LL, 0x207fffffU},
++    {0x207fffffU, 60000000LL, 100000LL, 0x207fffffU},
++    {0x207fffffU, 60000001LL, 100000LL, 0x207fffffU},
++    {0x207fffffU, 61000000LL, 100000LL, 0x207fffffU},
++    {0x207fffffU, 369657600LL, 100000LL, 0x207fffffU},
++    {0x207fffffU, 1288180530600LL, 2147483647LL, 0x207fffffU},
++    {0x207fffffU, 1288489188200LL, 2147483647LL, 0x207fffffU},
++    {0x207fffffU, 1288490188199LL, 2147483647LL, 0x207fffffU},
++    {0x207fffffU, 1288490188200LL, 2147483647LL, 0x207fffffU},
++    {0x207fffffU, 1288490188201LL, 2147483647LL, 0x207fffffU},
++    {0x207fffffU, 1288491188200LL, 2147483647LL, 0x207fffffU},
++    {0x207fffffU, 1288799845800LL, 2147483647LL, 0x207fffffU},
++};
++inline constexpr bool DAA_ANCHORED{false};
++inline constexpr uint32_t DAA_FIRST_FAST_BITS{0x207b6db5U};
++#endif
+diff --git a/test/functional/feature_daa.py b/test/functional/feature_daa.py
+new file mode 100644
+--- /dev/null
++++ b/test/functional/feature_daa.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The eCash developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Exercise this patch's compiled DAA in isolated regtest, including reorgs."""
++
++from test_framework.blocktools import create_block, create_coinbase
++from test_framework.daa import H, INTERVAL, next_bits
++from test_framework.messages import CBlockHeader, MAGIC_BYTES
++from test_framework.p2p import P2PInterface
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal, assert_raises_rpc_error
++
++# Existing eCash identity, scoped to this test; no production identity change.
++MAGIC_BYTES['regtest'] = bytes.fromhex('eca5b134')
++
++
++class DAATest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.setup_clean_chain = True
++        self.num_nodes = 3
++        # Upstream's framework writes bitcoin.conf; eCash defaults to ecash.conf.
++        self.extra_args = [
++            ['-conf=bitcoin.conf', '-test=daa'],
++            ['-conf=bitcoin.conf', '-test=daa', '-minimumchainwork=0x400'],
++            ['-conf=bitcoin.conf'],
++        ]
++
++    def setup_network(self):
++        self.setup_nodes()
++
++    def mine(self, end, *, alternate=False):
++        node = self.nodes[0]
++        while len(self.bits) <= end:
++            height = len(self.bits)
++            if alternate:
++                delta = 1300 if height == H-1 else 300
++            elif height < 180:
++                delta = 600
++            elif height < H+INTERVAL:
++                delta = 300
++            elif height < H+2*INTERVAL:
++                delta = 150
++            elif height < H+3*INTERVAL:
++                delta = 3600
++            else:
++                delta = 60 if height % 2 else 1140
++                if height == H+3*INTERVAL+40:
++                    delta = -100  # Valid raw time reversal, above previous MTP.
++            timestamp = max(self.times[-1]+delta, 1_600_000_000)
++            node.setmocktime(timestamp+10)
++            required = next_bits(self.bits, self.times, height)
++            if height in {H, H+1, 288} or height >= H and (height-H) % INTERVAL == 0:
++                template = node.getblocktemplate({'rules': ['segwit', 'bip300301']})
++                assert_equal(int(template['bits'],16), required)
++            block = create_block(int(node.getbestblockhash(),16), create_coinbase(height), timestamp)
++            block.nBits = required
++            if height in {H, H+1, 288, H+INTERVAL, H+2*INTERVAL}:
++                wrong = CBlockHeader(block)
++                wrong.nBits = required-1
++                # Header and full-block validation must reject the wrong bits.
++                # Solve with a temporary block so header PoW is genuinely valid.
++                block.nBits = wrong.nBits
++                block.solve()
++                wrong = CBlockHeader(block)
++                assert_raises_rpc_error(-25, 'bad-diffbits', node.submitheader, wrong.serialize().hex())
++                assert_equal(node.submitblock(block.serialize().hex()), 'bad-diffbits')
++                block.nBits = required
++            block.solve()
++            assert_equal(node.submitblock(block.serialize().hex()), None)
++            self.bits.append(required)
++            self.times.append(timestamp)
++            self.hashes.append(node.getbestblockhash())
++
++    def run_test(self):
++        node, peer, standard = self.nodes
++        node.add_p2p_connection(P2PInterface())
++        genesis = node.getblock(node.getbestblockhash())
++        self.bits = [int(genesis['bits'],16)]
++        self.times = [genesis['time']]
++        self.hashes = [node.getbestblockhash()]
++        self.log.info('Constant, changing, and oscillating timings across activation and four retargets')
++        self.mine(H+4*INTERVAL)
++        for n in range(H,H+INTERVAL):
++            assert_equal(self.bits[n],self.bits[H-1])
++        assert self.bits[H+INTERVAL] != self.bits[H-1]
++        peer.setmocktime(self.times[-1]+10)
++        self.log.info('Download headers through presync and redownload, then validate blocks')
++        self.connect_nodes(0,1)
++        self.sync_blocks(self.nodes[:2])
++        self.log.info('Standard regtest still has no retargeting')
++        self.generatetoaddress(standard, 145, standard.get_deterministic_priv_key().address, sync_fun=self.no_op)
++        assert_equal(standard.getblock(standard.getbestblockhash())['bits'],'207fffff')
++        self.log.info('Reorganize across activation and replace the fixed anchor')
++        self.disconnect_nodes(0,1)
++        node.invalidateblock(self.hashes[H-1])
++        self.bits = self.bits[:H-1]
++        self.times = self.times[:H-1]
++        self.hashes = self.hashes[:H-1]
++        self.mine(H+5*INTERVAL, alternate=True)
++        self.restart_node(0, extra_args=self.extra_args[0])
++        assert_equal(node.getblock(node.getbestblockhash())['bits'],f'{self.bits[-1]:08x}')
++        peer.setmocktime(self.times[-1]+10)
++        self.connect_nodes(0,1)
++        self.sync_blocks(self.nodes[:2])
++
++
++if __name__ == '__main__':
++    DAATest(__file__).main()
+diff --git a/test/functional/test_framework/daa.py b/test/functional/test_framework/daa.py
+new file mode 100644
+--- /dev/null
++++ b/test/functional/test_framework/daa.py
+@@ -0,0 +1,95 @@
++# Copyright (c) 2026 The eCash developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Independent integer specification and high-precision mathematical oracle.
++
++ALGORITHM is fixed by the selected source patch, not a node runtime option.
++"""
++from decimal import Decimal, localcontext
++
++ALGORITHM = 'linear'
++INTERVAL, SPACING, TIMESPAN, K, H = 144, 600, 86400, 14, 200
++POW_LIMIT = (1 << 255) - 1
++LN2_Q48 = 195103586505167
++
++def decode(bits):
++    size, word = bits >> 24, bits & 0x7fffff
++    assert not bits & 0x800000
++    return word >> (8 * (3-size)) if size <= 3 else word << (8 * (size-3))
++
++def compact(target):
++    size = (target.bit_length()+7)//8
++    word = target << (8*(3-size)) if size <= 3 else target >> (8*(size-3))
++    if word & 0x800000:
++        word >>= 8
++        size += 1
++    return (size << 24) | word
++
++def integer_target(bits, seconds, heights, limit=POW_LIMIT):
++    q = decode(bits)
++    if ALGORITHM == "linear":
++        s = min(212306, max(0, seconds))
++        value = q * (13*TIMESPAN+s) // (14*TIMESPAN)
++    elif ALGORITHM == "ratio":
++        s = min(345600, max(21600, seconds))
++        lo, hi = 0, 1 << 33
++        rhs = s << 448
++        while hi-lo > 1:
++            mid = (lo+hi)//2
++            if mid**14 * TIMESPAN <= rhs:
++                lo = mid
++            else:
++                hi = mid
++        value = q * lo // (1 << 32)
++    else:
++        error = seconds-SPACING*heights
++        if error >= 256*14*TIMESPAN:
++            return limit
++        if error <= -256*14*TIMESPAN:
++            return 1
++        magnitude = (abs(error) << 80)//(14*TIMESPAN*LN2_Q48)
++        exponent = -magnitude if error < 0 else magnitude
++        shifts, fraction = divmod(exponent, 1 << 32)
++        x = fraction*LN2_Q48//(1 << 32)
++        term = factor = 1 << 48
++        for i in range(1,19):
++            term = term*x//((1 << 48)*i)
++            factor += term
++        value = q*factor
++        shift = shifts-48
++        value = value << shift if shift >= 0 else value >> -shift
++    return min(limit, max(1,value))
++
++def calculate(bits, seconds, heights, limit=POW_LIMIT):
++    return compact(integer_target(bits, seconds, heights, limit))
++
++def real_target(bits, seconds, heights, limit=POW_LIMIT, precision=120):
++    with localcontext() as ctx:
++        ctx.prec = precision
++        q, t = Decimal(decode(bits)), Decimal(TIMESPAN)
++        if ALGORITHM == "linear":
++            value = q*(13*t+min(212306,max(0,seconds)))/(14*t)
++        elif ALGORITHM == "ratio":
++            s = Decimal(min(345600,max(21600,seconds)))
++            value = q*((s/t).ln()/14).exp()
++        else:
++            error = seconds-SPACING*heights
++            if error >= 256*14*TIMESPAN:
++                return Decimal(limit)
++            if error <= -256*14*TIMESPAN:
++                return Decimal(1)
++            value = q*(Decimal(error)/(14*t)).exp()
++        return min(Decimal(limit),max(Decimal(1),value))
++
++def next_bits(bits, times, height):
++    if height < H:
++        return bits[-1]  # Standard no-retargeting regtest, initially at powLimit.
++    if height == H or (height-H)%INTERVAL:
++        return bits[-1]
++    last = height-1
++    if ALGORITHM == "anchored":
++        return calculate(bits[H-1],times[last]-times[H-1],last-(H-1))
++    def mtp(h):
++        window = sorted(times[max(0,h-10):h+1])
++        return window[len(window)//2]
++    return calculate(bits[-1],mtp(last)-mtp(last-INTERVAL),INTERVAL)
+diff --git a/test/functional/test_runner.py b/test/functional/test_runner.py
+--- a/test/functional/test_runner.py
++++ b/test/functional/test_runner.py
+@@ -291,6 +291,7 @@
+     'wallet_importdescriptors.py',
+     'wallet_crosschain.py',
+     'mining_basic.py',
++    'feature_daa.py',
+     'mining_mainnet.py',
+     'feature_signet.py',
+     'p2p_mutated_blocks.py',

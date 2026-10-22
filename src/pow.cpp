@@ -92,6 +92,10 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
 // or decrease beyond the permitted limits.
 bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits)
 {
+    // Full validation requires this reset even when it exceeds legacy bounds.
+    if (height == params.EcashHeight && params.EcashForkBits != 0)
+        return new_nbits == params.EcashForkBits && DeriveTarget(new_nbits, params.powLimit).has_value();
+
     if (params.fPowAllowMinDifficultyBlocks) return true;
 
     if (height % params.DifficultyAdjustmentInterval() == 0) {

@@ -1,0 +1,2002 @@
+diff --git a/contrib/daa_reference.py b/contrib/daa_reference.py
+new file mode 100644
+--- /dev/null
++++ b/contrib/daa_reference.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The eCash developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Check the selected DAA specification against Decimal; regenerate C++ vectors."""
++import argparse
++import csv
++import re
++from decimal import Decimal
++from pathlib import Path
++import random
++import sys
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0,str(ROOT/'test/functional'))
++from test_framework import daa  # noqa: E402
++
++
++def vector_inputs():
++    values = []
++    for bits in [0x207fffff,0x1c123456,0x01010000,0x02008000]:
++        for s in [-1000000,0,21599,21600,21601,43199,43200,86399,86400,86401,212305,212306,212307,345599,345600,345601,2**63-1,-2**63]:
++            values.append((bits,s,144))
++    rng = random.Random(973728)
++    for _ in range(120):
++        values.append((rng.choice([0x207fffff,0x1c123456]),rng.randrange(-3000000,10000000),rng.randrange(144,30000)))
++    for h in [0,1,144,288,100000,2147483647]:
++        values.extend((0x207fffff,600*h+e,h) for e in [-309657600,-1000000,-1,0,1,1000000,309657600])
++    return values
++
++
++def read_golden():
++    path = ROOT/'src/test/data/asert_vectors.csv'
++    with path.open() as f:
++        rows = csv.reader(line for line in f if not line.startswith('#'))
++        return [tuple(int(value,0) for value in row) for row in rows]
++
++
++def check_upstream(directory):
++    count = 0
++    for path in sorted(directory.glob('run[0-9][0-9]')):
++        text = path.read_text()
++        height = int(re.search(r'anchor height: (\d+)',text)[1])
++        timestamp = int(re.search(r'anchor (?:ancestor|parent) time: (-?\d+)',text)[1])
++        bits = int(re.search(r'anchor nBits: (0x[0-9a-fA-F]+)',text)[1],16)
++        for line in text.splitlines():
++            if not line or line.startswith('#'):
++                continue
++            _,h,t,expected = line.split()
++            assert daa.calculate(bits,int(t)-timestamp,int(h)-height,daa.decode(0x1d00ffff)) == int(expected,16),(path.name,line)
++            count += 1
++    assert count > 0
++    return count
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--write-vectors',action='store_true')
++    parser.add_argument('--upstream-dir',type=Path,help='Optional directory containing all twelve published ASERT vector runs')
++    args = parser.parse_args()
++    vectors = vector_inputs()
++    samples = list(vectors)
++    rng = random.Random(144)
++    samples.extend((rng.choice([0x207fffff,0x1c123456]),rng.randrange(-30000000,30000000),rng.randrange(144,40000)) for _ in range(2000))
++    for bits,s,h in samples:
++        actual = daa.integer_target(bits,s,h)
++        real = daa.real_target(bits,s,h)
++        # Separately account for the final integer floor. This checks arithmetic
++        # before compact encoding, whose mantissa would hide approximation error.
++        assert abs(Decimal(actual)-real) <= max(Decimal(1),real*daa.RELATIVE_TOLERANCE), (bits,s,h)
++        assert daa.compact(int(daa.real_target(bits,s,h,precision=120))) == daa.compact(int(daa.real_target(bits,s,h,precision=170)))
++    # Check the entire Q16 polynomial domain, including its unsigned bound.
++    previous = 65536
++    for f in range(65536):
++        polynomial = 195766423245049*f + 971821376*f*f + 5127*f*f*f + (1 << 47)
++        assert polynomial < 1 << 64
++        factor = 65536 + (polynomial >> 48)
++        assert factor >= previous
++        previous = factor
++    golden = read_golden()
++    for bits,seconds,heights,expected in golden:
++        assert daa.calculate(bits,seconds,heights,daa.decode(0x1d00ffff)) == expected
++    upstream_count = check_upstream(args.upstream_dir) if args.upstream_dir else 0
++    simulation_retargets = 0
++    for profile in ('constant','step','oscillating'):
++        rng = random.Random(144)
++        bits, timestamp = 0x1c123456, 1_600_000_000
++        anchor_bits, parent_time = bits, timestamp-600
++        for period in range(42):
++            rate = 1 if profile == 'constant' else (2 if 14 <= period < 28 else 0.5) if profile == 'step' else (2 if period % 2 else 0.5)
++            for j in range(144):
++                mean = 600*daa.decode(anchor_bits)/(rate*daa.decode(bits))
++                timestamp += max(1,int(rng.expovariate(1/mean)))
++                heights = period*144+j+1
++                value = daa.integer_target(anchor_bits,timestamp-parent_time,heights)
++                real = daa.real_target(anchor_bits,timestamp-parent_time,heights)
++                assert abs(Decimal(value)-real) <= max(Decimal(1),real*daa.RELATIVE_TOLERANCE)
++                bits = daa.compact(value)
++                assert 0 < daa.decode(bits) <= daa.POW_LIMIT
++                simulation_retargets += 1
++    if args.write_vectors:
++        rows = []
++        for bits,s,h in vectors:
++            literal = 'std::numeric_limits<int64_t>::min()' if s == -2**63 else f'{s}LL'
++            rows.append(f'    {{0x{bits:08x}U, {literal}, {h}LL, 0x{daa.calculate(bits,s,h):08x}U}},')
++        text = '''// Generated from the independent Python integer specification; also checked
++// against a 120-digit Decimal oracle. Regenerate with contrib/daa_reference.py.
++#ifndef BITCOIN_TEST_DAA_VECTORS_H
++#define BITCOIN_TEST_DAA_VECTORS_H
++#include <cstdint>
++#include <limits>
++struct DAAVector { uint32_t bits; int64_t seconds; int64_t heights; uint32_t expected; };
++inline constexpr DAAVector DAA_VECTORS[]{
++'''+'\n'.join(rows)+'\n};\n'+f'inline constexpr bool DAA_ANCHORED{{true}};\ninline constexpr uint32_t DAA_FIRST_FAST_BITS{{0x{daa.calculate(0x207fffff,600,1):08x}U}};\n#endif\n'
++        (ROOT/'src/test/daa_vectors.h').write_text(text)
++        golden_header = '// Published ASERT vector subset; see data/asert_vectors.README.md.\n#ifndef BITCOIN_TEST_DAA_ASERT_VECTORS_H\n#define BITCOIN_TEST_DAA_ASERT_VECTORS_H\n#include <cstdint>\nstruct ASERTVector { uint32_t bits; int64_t seconds; int64_t heights; uint32_t expected; };\ninline constexpr ASERTVector ASERT_VECTORS[]{\n'
++        golden_header += ''.join(f'    {{0x{bits:08x}U, {seconds}LL, {heights}LL, 0x{expected:08x}U}},\n' for bits,seconds,heights,expected in golden)
++        golden_header += '};\n#endif\n'
++        (ROOT/'src/test/daa_asert_vectors.h').write_text(golden_header)
++    print(f'ASERT: {len(samples)} Decimal checks; {len(vectors)} numerical vectors; {len(golden)} published vectors; {upstream_count} full upstream vectors; {simulation_retargets} simulated retargets; 65536 polynomial fractions')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/doc/daa.md b/doc/daa.md
+new file mode 100644
+--- /dev/null
++++ b/doc/daa.md
+@@ -0,0 +1,39 @@
++**Experimental eCash DAA: ASERT (aserti3-2d)**
++
++Apply the unchanged common foundation plus `0002-daa-asert.patch`. This is the fourth independent alternative. Each source patch supplies one compiled algorithm; every public `DAAHeight` remains unset. The production algorithm and future eCash activation height are still deployment decisions.
++
++This option follows [BCHN's aserti3-2d arithmetic specification](https://upgradespecs.bitcoincashnode.org/2020-11-15-asert/): 600-second spacing, a 172800-second base-2 half-life, raw timestamps, Q16 exponent quantization, the published cubic approximation, and no relative adjustment clamp. The absolute `powLimit` and minimum representable target 1 still apply. This is a different response speed as well as a different cadence from the original 144-block anchored exponential alternative, whose natural-exponential time constant is fourteen days.
++
++The eCash integration preserves H as a carry block and starts per-block adjustments at H+1. For candidate height n > H, the fixed target/height anchor is H−1 and the timestamp reference is its parent, H−2. Using evaluation block h=n−1, the ideal formula is:
++
++```text
++Q(n) = Q(H−1) * 2^(((t(h) − t(H−2)) − 600 * (h − (H−1) + 1)) / 172800)
++```
++
++The arithmetic includes the standard `height_delta + 1` convention. The anchor's own raw timestamp is not the timestamp reference. H must be at least 2 and later than `EcashHeight`. The public future-fork requirement already places it beyond the original height-973728 reset. The original retarget function and separate eCash reset enforcement remain intact.
++
++`daa::Retarget()` in this alternative returns true for every height after H. This changes the new schedule only; legacy target timespan, BIP9 periods/thresholds, and timestamp validity retain their original settings. The initial carry block and height-based deployment are eCash integration choices; BCH's activation mechanism and public-testnet policies are not introduced.
++
++Signed exponent division truncates toward zero. The integer/fractional split then uses floor division with a nonnegative Q16 fraction. The cubic coefficients and rounding constant are exactly those specified for aserti3-2d. The full target product is widened before the final power-of-two shift, so regtest's 255-bit limit is supported safely. Extreme errors beyond ±256 half-lives saturate by absolute 256-bit representability, without adding a per-block clamp. All consensus operations use standard integer types and the existing common helper.
++
++The target is always derived from the candidate branch's original anchor. Headers presync and redownload each track their own anchor and anchor-parent timestamp, initialized either from known ancestry or the header stream. Both phases verify exact ASERT targets on every active adjustment. The context-free transition check admits valid targets at these heights; the stateful check supplies the missing anchor/time context. There is no global anchor cache to survive a reorganization incorrectly.
++
++`-regtest -test=daa` activates this source patch at synthetic H=200. Standard regtest is unchanged. After activation the test mode ignores its normal no-retargeting and minimum-difficulty escapes. Existing startup checks reject `-test` outside regtest, and combining this mode with BIP94 is rejected. No network identity or public-testnet activation setting changes.
++
++Build and test with Python 3.10 or later:
++
++```sh
++cmake -S . -B build -G Ninja -DBUILD_TESTS=ON -DENABLE_IPC=OFF -DENABLE_WALLET=OFF
++cmake --build build --target bitcoind bitcoin-cli test_bitcoin
++build/bin/test_bitcoin --run_test=daa_common_tests,daa_tests,pow_tests,headers_sync_chainwork_tests
++python3 contrib/daa_reference.py
++python3 test/functional/feature_daa.py --configfile=build/test/config.ini
++```
++
++`contrib/daa_reference.py --write-vectors` regenerates both C++ headers. Tests include 234 numerical edge vectors and 396 expected outcomes selected directly from the [twelve published ASERT runs](https://download.bitcoincashnode.org/misc/data/asert/test_vectors/). The independent integer reference was also checked against all 14000 published outcomes; `--upstream-dir /path/to/runs` reproduces that larger check. Provenance and file hashes are in `src/test/data/asert_vectors.README.md`.
++
++The reference also checks 2234 cases against 120-digit Decimal arithmetic with 170-digit compact stability, all 65536 polynomial fractions for monotonicity and unsigned bounds, and 18144 per-block adjustments under seeded constant, step, and oscillating hashrate. Its numerical tolerance is 1.5e-4 relative before compact conversion, allowing the specified ASERT cubic and exponent quantization, plus one target unit for flooring. The original higher-precision anchored alternative retains its tighter 5e-10 tolerance.
++
++C++ and node tests cover initial carry, first adjustment, consecutive block adjustments, exact half-life doubling/halving, raw time reversal, limits and extreme errors, template/header/block bits, both headers-sync phases, standard regtest, restart, and a reorganization replacing the anchor and its parent. Existing Core tests can use `contrib/ecash_functional.py` for this base's established configuration filename, magic bytes, and mining-RPC testing policy.
++
++Raw timestamp and anchor-parent influence remain relevant. Numerical agreement and these chain scenarios do not establish a general stability or adversarial security proof. Public deployment remains separate from this experiment.
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -124,6 +124,7 @@
+   policy/policy.cpp
+   pow.cpp
+   daa.cpp
++  daa_algorithm.cpp
+   protocol.cpp
+   psbt.cpp
+   rpc/rawtransaction_util.cpp
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -45,6 +45,7 @@
+ {
+     if (auto value = args.GetBoolArg("-fastprune")) options.fastprune = *value;
+     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
++    if (HasTestOption(args, "daa")) options.test_daa = true;
+ 
+     for (const std::string& arg : args.GetArgs("-testactivationheight")) {
+         const auto found{arg.find('@')};
+diff --git a/src/common/args.cpp b/src/common/args.cpp
+--- a/src/common/args.cpp
++++ b/src/common/args.cpp
+@@ -744,6 +744,7 @@
+     "addrman (use deterministic addrman)",
+     "reindex_after_failure_noninteractive_yes (When asked for a reindex after failure interactively, simulate as-if answered with 'yes')",
+     "bip94 (enforce BIP94 consensus rules)",
++    "daa (enable this build's experimental DAA at synthetic regtest height 200)",
+ };
+ 
+ bool HasTestOption(const ArgsManager& args, const std::string& test_option)
+diff --git a/src/daa.cpp b/src/daa.cpp
+--- a/src/daa.cpp
++++ b/src/daa.cpp
+@@ -11,13 +11,13 @@
+ namespace daa {
+ bool Active(const Consensus::Params& params, int64_t height)
+ {
+-    assert(!params.DAAHeight || (*params.DAAHeight > 0 && *params.DAAHeight > params.EcashHeight));
++    assert(!params.DAAHeight || (*params.DAAHeight >= 2 && *params.DAAHeight > params.EcashHeight));
+     return params.DAAHeight && height >= *params.DAAHeight;
+ }
+ 
+ bool Retarget(const Consensus::Params& params, int64_t height)
+ {
+-    return Active(params, height) && height > *params.DAAHeight && (height - *params.DAAHeight) % INTERVAL == 0;
++    return Active(params, height) && height > *params.DAAHeight;
+ }
+ 
+ arith_uint256 ScaleTarget(const arith_uint256& target, uint64_t numerator, uint64_t denominator, const arith_uint256& limit)
+diff --git a/src/daa_algorithm.cpp b/src/daa_algorithm.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/daa_algorithm.cpp
+@@ -0,0 +1,59 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <daa_algorithm.h>
++#include <chain.h>
++#include <pow.h>
++#include <util/check.h>
++
++#include <cassert>
++#include <limits>
++
++namespace daa {
++namespace {
++constexpr int64_t HALF_LIFE{172800};
++constexpr int64_t RADIX{65536};
++} // namespace
++
++uint32_t CalculateTarget(uint32_t reference_bits, int64_t time_delta, int64_t height_delta, const uint256& pow_limit)
++{
++    const auto target = *Assert(DeriveTarget(reference_bits, pow_limit));
++    const auto limit = UintToArith256(pow_limit);
++    assert(height_delta >= 0 && height_delta <= std::numeric_limits<int>::max());
++    // BCH ASERT uses the anchor's PARENT time, and counts one more interval.
++    const int64_t ideal = (height_delta + 1) * SPACING;
++    // Absolute representability bounds, not per-block adjustment clamps.
++    // 2^256 exceeds every valid target; the inverse produces a target below 1.
++    if (time_delta >= ideal + 256 * HALF_LIFE) return limit.GetCompact();
++    if (time_delta <= ideal - 256 * HALF_LIFE) return arith_uint256{1}.GetCompact();
++    const int64_t exponent = ((time_delta - ideal) * RADIX) / HALF_LIFE;
++    int64_t shifts = exponent / RADIX;
++    int64_t fraction = exponent % RADIX;
++    if (fraction < 0) { fraction += RADIX; --shifts; }
++    const uint64_t f = fraction;
++    // aserti3-2d Q16 cubic and rounding constant, as specified by BCHN.
++    // At f <= 65535 this entire unsigned sum fits uint64_t.
++    const uint64_t factor = 65536 + ((195766423245049ULL * f + 971821376ULL * f * f +
++                                      5127ULL * f * f * f + (uint64_t{1} << 47)) >> 48);
++    // Widen before multiplying: regtest has a 255-bit limit, unlike BCH mainnet.
++    return ScaleTargetPow2(target, factor, shifts - 16, limit).GetCompact();
++}
++
++uint32_t GetWorkRequired(const CBlockIndex& last, const Consensus::Params& params)
++{
++    const int64_t next = int64_t{last.nHeight} + 1;
++    assert(Active(params, next));
++    if (!Retarget(params, next)) return last.nBits; // H is the sole carry block.
++    const auto* anchor = Assert(last.GetAncestor(*params.DAAHeight - 1));
++    const auto* parent = Assert(anchor->pprev);
++    return CalculateTarget(anchor->nBits, last.GetBlockTime() - parent->GetBlockTime(), int64_t{last.nHeight} - anchor->nHeight, params.powLimit);
++}
++
++bool PermittedTransition(const Consensus::Params& params, int64_t height, uint32_t old_bits, uint32_t new_bits)
++{
++    if (!DeriveTarget(old_bits, params.powLimit) || !DeriveTarget(new_bits, params.powLimit)) return false;
++    // Anchor/timestamp context in both headers-sync phases checks exact bits.
++    return Retarget(params, height) || old_bits == new_bits;
++}
++} // namespace daa
+diff --git a/src/daa_algorithm.h b/src/daa_algorithm.h
+new file mode 100644
+--- /dev/null
++++ b/src/daa_algorithm.h
+@@ -0,0 +1,22 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_DAA_ALGORITHM_H
++#define BITCOIN_DAA_ALGORITHM_H
++
++#include <daa.h>
++
++class CBlockIndex;
++
++namespace daa {
++/** reference_bits is the preceding target for partial retargets, or the fixed
++ * anchor target for anchored exponential. height_delta is relative to that
++ * anchor. For ASERT, time_delta is relative to the anchor's parent and the
++ * formula includes height_delta + 1. Inputs come from validated ancestors. */
++uint32_t CalculateTarget(uint32_t reference_bits, int64_t time_delta, int64_t height_delta, const uint256& pow_limit);
++uint32_t GetWorkRequired(const CBlockIndex& last, const Consensus::Params& params);
++bool PermittedTransition(const Consensus::Params& params, int64_t height, uint32_t old_bits, uint32_t new_bits);
++} // namespace daa
++
++#endif // BITCOIN_DAA_ALGORITHM_H
+diff --git a/src/daa_headers.h b/src/daa_headers.h
+new file mode 100644
+--- /dev/null
++++ b/src/daa_headers.h
+@@ -0,0 +1,59 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_DAA_HEADERS_H
++#define BITCOIN_DAA_HEADERS_H
++
++#include <chain.h>
++#include <daa_algorithm.h>
++#include <pow.h>
++
++#include <optional>
++
++namespace daa {
++/** Small independent state for each headers-sync phase. Tracks the anchor on
++ * the streamed branch, never a global best-chain anchor. Header PoW and
++ * continuity remain the caller's responsibility. */
++class HeaderState {
++    struct Anchor { int height; uint32_t parent_time; uint32_t bits; };
++    std::optional<Anchor> m_anchor;
++    int64_t m_height;
++    uint32_t m_time;
++    uint32_t m_bits;
++
++public:
++    HeaderState(const Consensus::Params& params, const CBlockIndex& start)
++        : m_height(start.nHeight), m_time(start.nTime), m_bits(start.nBits)
++    {
++        if (params.DAAHeight && start.nHeight >= *params.DAAHeight - 1) {
++            const auto* anchor = start.GetAncestor(*params.DAAHeight - 1);
++            assert(anchor && anchor->pprev);
++            m_anchor = Anchor{anchor->nHeight, anchor->pprev->nTime, anchor->nBits};
++        }
++    }
++
++    bool Check(const Consensus::Params& params, int64_t height, const CBlockHeader& header)
++    {
++        if (!params.DAAHeight) return true;
++        if (height != m_height + 1) return false;
++        if (height == *params.DAAHeight - 1) {
++            if (!DeriveTarget(header.nBits, params.powLimit)) return false;
++            m_anchor = Anchor{static_cast<int>(height), m_time, header.nBits};
++        }
++        if (Active(params, height)) {
++            if (!m_anchor || !DeriveTarget(m_anchor->bits, params.powLimit)) return false;
++            const uint32_t expected = Retarget(params, height)
++                ? CalculateTarget(m_anchor->bits, int64_t{m_time} - m_anchor->parent_time, m_height - m_anchor->height, params.powLimit)
++                : m_bits;
++            if (header.nBits != expected) return false;
++        }
++        m_height = height;
++        m_time = header.nTime;
++        m_bits = header.nBits;
++        return true;
++    }
++};
++} // namespace daa
++
++#endif // BITCOIN_DAA_HEADERS_H
+diff --git a/src/headerssync.cpp b/src/headerssync.cpp
+--- a/src/headerssync.cpp
++++ b/src/headerssync.cpp
+@@ -28,7 +28,9 @@
+       m_minimum_required_work(minimum_required_work),
+       m_current_chain_work(chain_start.nChainWork),
+       m_last_header_received(m_chain_start.GetBlockHeader()),
+-      m_current_height(chain_start.nHeight)
++      m_current_height(chain_start.nHeight),
++      m_daa_presync(consensus_params, chain_start),
++      m_daa_redownload(consensus_params, chain_start)
+ {
+     // Estimate the number of blocks that could possibly exist on the peer's
+     // chain *right now* using 6 blocks/second (fastest blockrate given the MTP
+@@ -192,6 +194,11 @@
+         return false;
+     }
+ 
++    if (!m_daa_presync.Check(m_consensus_params, next_height, current)) {
++        LogDebug(BCLog::NET, "Initial headers sync aborted: incorrect ASERT target (presync phase)\n");
++        return false;
++    }
++
+     if (next_height % m_params.commitment_period == m_commit_offset) {
+         // Add a commitment.
+         m_header_commitments.push_back(m_hasher(current.GetHash()) & 1);
+@@ -237,6 +244,11 @@
+     if (!PermittedDifficultyTransition(m_consensus_params, next_height,
+                 previous_nBits, header.nBits)) {
+         LogDebug(BCLog::NET, "Initial headers sync aborted with peer=%d: invalid difficulty transition at height=%i (redownload phase)\n", m_id, next_height);
++        return false;
++    }
++
++    if (!m_daa_redownload.Check(m_consensus_params, next_height, header)) {
++        LogDebug(BCLog::NET, "Initial headers sync aborted: incorrect ASERT target (redownload phase)\n");
+         return false;
+     }
+ 
+diff --git a/src/headerssync.h b/src/headerssync.h
+--- a/src/headerssync.h
++++ b/src/headerssync.h
+@@ -7,6 +7,7 @@
+ 
+ #include <arith_uint256.h>
+ #include <chain.h>
++#include <daa_headers.h>
+ #include <consensus/params.h>
+ #include <net.h>
+ #include <primitives/block.h>
+@@ -278,6 +279,9 @@
+ 
+     /** Current state of our headers sync. */
+     State m_download_state{State::PRESYNC};
++
++    daa::HeaderState m_daa_presync;
++    daa::HeaderState m_daa_redownload;
+ };
+ 
+ #endif // BITCOIN_HEADERSSYNC_H
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -43,6 +43,7 @@
+   ../policy/truc_policy.cpp
+   ../pow.cpp
+   ../daa.cpp
++  ../daa_algorithm.cpp
+   ../primitives/block.cpp
+   ../primitives/transaction.cpp
+   ../pubkey.cpp
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -9,6 +9,7 @@
+ #include <consensus/amount.h>
+ #include <consensus/merkle.h>
+ #include <consensus/params.h>
++#include <daa.h>
+ #include <crypto/hex_base.h>
+ #include <hash.h>
+ #include <kernel/messagestartchars.h>
+@@ -600,6 +601,12 @@
+         consensus.fPowAllowMinDifficultyBlocks = true;
+         consensus.enforce_BIP94 = opts.enforce_bip94;
+         consensus.fPowNoRetargeting = true;
++        // Explicit test mode only. Standard regtest keeps all legacy behavior;
++        // in test mode the active DAA ignores no-retarget/min-difficulty escapes.
++        if (opts.test_daa) {
++            if (opts.enforce_bip94) throw std::invalid_argument("DAA test mode cannot be combined with BIP94");
++            consensus.DAAHeight = daa::REGTEST_HEIGHT;
++        }
+ 
+         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
+         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
+diff --git a/src/kernel/chainparams.h b/src/kernel/chainparams.h
+--- a/src/kernel/chainparams.h
++++ b/src/kernel/chainparams.h
+@@ -152,6 +152,7 @@
+         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
+         bool fastprune{false};
+         bool enforce_bip94{false};
++        bool test_daa{false};
+     };
+ 
+     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);
+diff --git a/src/pow.cpp b/src/pow.cpp
+--- a/src/pow.cpp
++++ b/src/pow.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <arith_uint256.h>
+ #include <chain.h>
++#include <daa_algorithm.h>
+ #include <primitives/block.h>
+ #include <uint256.h>
+ #include <util/check.h>
+@@ -14,6 +15,8 @@
+ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
+ {
+     assert(pindexLast != nullptr);
++    if (daa::Active(params, int64_t{pindexLast->nHeight} + 1))
++        return daa::GetWorkRequired(*pindexLast, params);
+     unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
+ 
+     // Only change once per difficulty adjustment interval
+@@ -96,6 +99,9 @@
+     if (height == params.EcashHeight && params.EcashForkBits != 0)
+         return new_nbits == params.EcashForkBits && DeriveTarget(new_nbits, params.powLimit).has_value();
+ 
++    if (daa::Active(params, height))
++        return daa::PermittedTransition(params, height, old_nbits, new_nbits);
++
+     if (params.fPowAllowMinDifficultyBlocks) return true;
+ 
+     if (height % params.DifficultyAdjustmentInterval() == 0) {
+diff --git a/src/pow.h b/src/pow.h
+--- a/src/pow.h
++++ b/src/pow.h
+@@ -38,11 +38,13 @@
+  * given height is not possible, given the proof-of-work on the prior block as
+  * specified by old_nbits.
+  *
+- * This function only checks that the new value is within a factor of 4 of the
++ * Before experimental DAA activation, this function checks a factor of 4 of the
+  * old value for blocks at the difficulty adjustment interval, and otherwise
+- * requires the values to be the same.
++ * requires the values to be the same, except for the prescribed eCash reset.
++ * The experimental regime uses its own schedule and algorithm bounds. An
++ * unbounded anchored transition needs additional anchor context in headerssync.
+  *
+- * Always returns true on networks where min difficulty blocks are allowed,
++ * Before activation, returns true on networks where min difficulty blocks are allowed,
+  * such as regtest/testnet.
+  */
+ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits);
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -40,6 +40,7 @@
+   cuckoocache_tests.cpp
+   dbwrapper_tests.cpp
+   daa_common_tests.cpp
++  daa_tests.cpp
+   denialofservice_tests.cpp
+   descriptor_tests.cpp
+   disconnected_transactions.cpp
+diff --git a/src/test/daa_asert_vectors.h b/src/test/daa_asert_vectors.h
+new file mode 100644
+--- /dev/null
++++ b/src/test/daa_asert_vectors.h
+@@ -0,0 +1,404 @@
++// Published ASERT vector subset; see data/asert_vectors.README.md.
++#ifndef BITCOIN_TEST_DAA_ASERT_VECTORS_H
++#define BITCOIN_TEST_DAA_ASERT_VECTORS_H
++#include <cstdint>
++struct ASERTVector { uint32_t bits; int64_t seconds; int64_t heights; uint32_t expected; };
++inline constexpr ASERTVector ASERT_VECTORS[]{
++    {0x1d00ffffU, 1200LL, 1LL, 0x1d00ffffU},
++    {0x1d00ffffU, 1800LL, 2LL, 0x1d00ffffU},
++    {0x1d00ffffU, 2400LL, 3LL, 0x1d00ffffU},
++    {0x1d00ffffU, 3000LL, 4LL, 0x1d00ffffU},
++    {0x1d00ffffU, 3600LL, 5LL, 0x1d00ffffU},
++    {0x1d00ffffU, 4200LL, 6LL, 0x1d00ffffU},
++    {0x1d00ffffU, 4800LL, 7LL, 0x1d00ffffU},
++    {0x1d00ffffU, 5400LL, 8LL, 0x1d00ffffU},
++    {0x1d00ffffU, 6000LL, 9LL, 0x1d00ffffU},
++    {0x1d00ffffU, 6600LL, 10LL, 0x1d00ffffU},
++    {0x1a2b3c4dU, 1200LL, 1LL, 0x1a2b3c4dU},
++    {0x1a2b3c4dU, 1800LL, 2LL, 0x1a2b3c4dU},
++    {0x1a2b3c4dU, 2400LL, 3LL, 0x1a2b3c4dU},
++    {0x1a2b3c4dU, 3000LL, 4LL, 0x1a2b3c4dU},
++    {0x1a2b3c4dU, 3600LL, 5LL, 0x1a2b3c4dU},
++    {0x1a2b3c4dU, 4200LL, 6LL, 0x1a2b3c4dU},
++    {0x1a2b3c4dU, 4800LL, 7LL, 0x1a2b3c4dU},
++    {0x1a2b3c4dU, 5400LL, 8LL, 0x1a2b3c4dU},
++    {0x1a2b3c4dU, 6000LL, 9LL, 0x1a2b3c4dU},
++    {0x1a2b3c4dU, 6600LL, 10LL, 0x1a2b3c4dU},
++    {0x01010000U, 1200LL, 1LL, 0x01010000U},
++    {0x01010000U, 1800LL, 2LL, 0x01010000U},
++    {0x01010000U, 2400LL, 3LL, 0x01010000U},
++    {0x01010000U, 3000LL, 4LL, 0x01010000U},
++    {0x01010000U, 3600LL, 5LL, 0x01010000U},
++    {0x01010000U, 4200LL, 6LL, 0x01010000U},
++    {0x01010000U, 4800LL, 7LL, 0x01010000U},
++    {0x01010000U, 5400LL, 8LL, 0x01010000U},
++    {0x01010000U, 6000LL, 9LL, 0x01010000U},
++    {0x01010000U, 6600LL, 10LL, 0x01010000U},
++    {0x01010000U, 174000LL, 1LL, 0x01020000U},
++    {0x01010000U, 347400LL, 2LL, 0x01040000U},
++    {0x01010000U, 520800LL, 3LL, 0x01080000U},
++    {0x01010000U, 694200LL, 4LL, 0x01100000U},
++    {0x01010000U, 867600LL, 5LL, 0x01200000U},
++    {0x01010000U, 1041000LL, 6LL, 0x01400000U},
++    {0x01010000U, 1214400LL, 7LL, 0x02008000U},
++    {0x01010000U, 1387800LL, 8LL, 0x02010000U},
++    {0x01010000U, 1561200LL, 9LL, 0x02020000U},
++    {0x01010000U, 1734600LL, 10LL, 0x02040000U},
++    {0x01010000U, 2601600LL, 15LL, 0x03008000U},
++    {0x01010000U, 3815400LL, 22LL, 0x03400000U},
++    {0x01010000U, 5029200LL, 29LL, 0x04200000U},
++    {0x01010000U, 6416400LL, 37LL, 0x05200000U},
++    {0x01010000U, 7630200LL, 44LL, 0x06100000U},
++    {0x01010000U, 8844000LL, 51LL, 0x07080000U},
++    {0x01010000U, 10057800LL, 58LL, 0x08040000U},
++    {0x01010000U, 11445000LL, 66LL, 0x09040000U},
++    {0x01010000U, 12658800LL, 73LL, 0x0a020000U},
++    {0x01010000U, 13872600LL, 80LL, 0x0b010000U},
++    {0x01010000U, 15086400LL, 87LL, 0x0c008000U},
++    {0x01010000U, 16300200LL, 94LL, 0x0c400000U},
++    {0x01010000U, 17687400LL, 102LL, 0x0d400000U},
++    {0x01010000U, 18901200LL, 109LL, 0x0e200000U},
++    {0x01010000U, 20115000LL, 116LL, 0x0f100000U},
++    {0x01010000U, 21328800LL, 123LL, 0x10080000U},
++    {0x01010000U, 22716000LL, 131LL, 0x11080000U},
++    {0x01010000U, 23929800LL, 138LL, 0x12040000U},
++    {0x01010000U, 25143600LL, 145LL, 0x13020000U},
++    {0x01010000U, 26357400LL, 152LL, 0x14010000U},
++    {0x01010000U, 27571200LL, 159LL, 0x15008000U},
++    {0x01010000U, 28958400LL, 167LL, 0x16008000U},
++    {0x01010000U, 30172200LL, 174LL, 0x16400000U},
++    {0x01010000U, 31386000LL, 181LL, 0x17200000U},
++    {0x01010000U, 32599800LL, 188LL, 0x18100000U},
++    {0x01010000U, 33987000LL, 196LL, 0x19100000U},
++    {0x01010000U, 35200800LL, 203LL, 0x1a080000U},
++    {0x01010000U, 36414600LL, 210LL, 0x1b040000U},
++    {0x01010000U, 37455000LL, 216LL, 0x1c010000U},
++    {0x01010000U, 37628400LL, 217LL, 0x1c020000U},
++    {0x01010000U, 37801800LL, 218LL, 0x1c040000U},
++    {0x01010000U, 37975200LL, 219LL, 0x1c080000U},
++    {0x01010000U, 38148600LL, 220LL, 0x1c100000U},
++    {0x01010000U, 38322000LL, 221LL, 0x1c200000U},
++    {0x01010000U, 38495400LL, 222LL, 0x1c400000U},
++    {0x01010000U, 38668800LL, 223LL, 0x1d008000U},
++    {0x01010000U, 38842200LL, 224LL, 0x1d00ffffU},
++    {0x01010000U, 39015600LL, 225LL, 0x1d00ffffU},
++    {0x1d00ffffU, 0LL, 1LL, 0x1d00fec5U},
++    {0x1d00ffffU, 0LL, 289LL, 0x1c7f62c0U},
++    {0x1d00ffffU, 0LL, 577LL, 0x1c3fb160U},
++    {0x1d00ffffU, 0LL, 865LL, 0x1c1fd8b0U},
++    {0x1d00ffffU, 0LL, 1153LL, 0x1c0fec58U},
++    {0x1d00ffffU, 0LL, 1441LL, 0x1c07f62cU},
++    {0x1d00ffffU, 0LL, 1729LL, 0x1c03fb16U},
++    {0x1d00ffffU, 0LL, 2017LL, 0x1c01fd8bU},
++    {0x1d00ffffU, 0LL, 2305LL, 0x1c00fec5U},
++    {0x1d00ffffU, 0LL, 2593LL, 0x1b7f62c0U},
++    {0x1d00ffffU, 0LL, 4033LL, 0x1b03fb16U},
++    {0x1d00ffffU, 0LL, 6049LL, 0x1a07f62cU},
++    {0x1d00ffffU, 0LL, 8065LL, 0x190fec58U},
++    {0x1d00ffffU, 0LL, 10369LL, 0x180fec58U},
++    {0x1d00ffffU, 0LL, 12385LL, 0x171fd8b0U},
++    {0x1d00ffffU, 0LL, 14401LL, 0x163fb160U},
++    {0x1d00ffffU, 0LL, 16417LL, 0x157f62c0U},
++    {0x1d00ffffU, 0LL, 18721LL, 0x147f62c0U},
++    {0x1d00ffffU, 0LL, 20737LL, 0x1400fec5U},
++    {0x1d00ffffU, 0LL, 22753LL, 0x1301fd8bU},
++    {0x1d00ffffU, 0LL, 24769LL, 0x1203fb16U},
++    {0x1d00ffffU, 0LL, 26785LL, 0x1107f62cU},
++    {0x1d00ffffU, 0LL, 29089LL, 0x1007f62cU},
++    {0x1d00ffffU, 0LL, 31105LL, 0x0f0fec58U},
++    {0x1d00ffffU, 0LL, 33121LL, 0x0e1fd8b0U},
++    {0x1d00ffffU, 0LL, 35137LL, 0x0d3fb160U},
++    {0x1d00ffffU, 0LL, 37441LL, 0x0c3fb160U},
++    {0x1d00ffffU, 0LL, 39457LL, 0x0b7f62c0U},
++    {0x1d00ffffU, 0LL, 41473LL, 0x0b00fec5U},
++    {0x1d00ffffU, 0LL, 43489LL, 0x0a01fd8bU},
++    {0x1d00ffffU, 0LL, 45505LL, 0x0903fb16U},
++    {0x1d00ffffU, 0LL, 47809LL, 0x0803fb16U},
++    {0x1d00ffffU, 0LL, 49825LL, 0x0707f62cU},
++    {0x1d00ffffU, 0LL, 51841LL, 0x060fec58U},
++    {0x1d00ffffU, 0LL, 53857LL, 0x051fd8b0U},
++    {0x1d00ffffU, 0LL, 56161LL, 0x041fd8b0U},
++    {0x1d00ffffU, 0LL, 58177LL, 0x033fb160U},
++    {0x1d00ffffU, 0LL, 60193LL, 0x027f6200U},
++    {0x1d00ffffU, 0LL, 61921LL, 0x0201fd00U},
++    {0x1d00ffffU, 0LL, 62209LL, 0x0200fe00U},
++    {0x1d00ffffU, 0LL, 62497LL, 0x017f0000U},
++    {0x1d00ffffU, 0LL, 62785LL, 0x013f0000U},
++    {0x1d00ffffU, 0LL, 63073LL, 0x011f0000U},
++    {0x1d00ffffU, 0LL, 63361LL, 0x010f0000U},
++    {0x1d00ffffU, 0LL, 63649LL, 0x01070000U},
++    {0x1d00ffffU, 0LL, 63937LL, 0x01030000U},
++    {0x1d00ffffU, 0LL, 64225LL, 0x01010000U},
++    {0x1d00ffffU, 0LL, 64513LL, 0x01010000U},
++    {0x1802aee8U, 1200LL, 1LL, 0x1802aee8U},
++    {0x1802aee8U, 1310LL, 2LL, 0x1802ad91U},
++    {0x1802aee8U, 1327LL, 3LL, 0x1802abf8U},
++    {0x1802aee8U, 1739LL, 4LL, 0x1802ab73U},
++    {0x1802aee8U, 2219LL, 5LL, 0x1802ab20U},
++    {0x1802aee8U, 2604LL, 6LL, 0x1802aa89U},
++    {0x1802aee8U, 2746LL, 7LL, 0x1802a94bU},
++    {0x1802aee8U, 7099LL, 8LL, 0x1802b39cU},
++    {0x1802aee8U, 7099LL, 9LL, 0x1802b1f2U},
++    {0x1802aee8U, 7657LL, 10LL, 0x1802b1d4U},
++    {0x1802aee8U, 24981LL, 33LL, 0x1802bbaeU},
++    {0x1802aee8U, 42647LL, 65LL, 0x1802b760U},
++    {0x1802aee8U, 61599LL, 97LL, 0x1802b6aeU},
++    {0x1802aee8U, 79167LL, 129LL, 0x1802b222U},
++    {0x1802aee8U, 95663LL, 162LL, 0x1802a910U},
++    {0x1802aee8U, 120141LL, 194LL, 0x1802b7a3U},
++    {0x1802aee8U, 143823LL, 226LL, 0x1802c449U},
++    {0x1802aee8U, 163885LL, 258LL, 0x1802c6bdU},
++    {0x1802aee8U, 184205LL, 291LL, 0x1802c83aU},
++    {0x1802aee8U, 205986LL, 323LL, 0x1802cfa6U},
++    {0x1802aee8U, 221242LL, 355LL, 0x1802c457U},
++    {0x1802aee8U, 239252LL, 387LL, 0x1802c0f4U},
++    {0x1802aee8U, 253248LL, 419LL, 0x1802b25dU},
++    {0x1802aee8U, 272468LL, 452LL, 0x1802b0c0U},
++    {0x1802aee8U, 291161LL, 484LL, 0x1802af58U},
++    {0x1802aee8U, 311159LL, 516LL, 0x1802b18eU},
++    {0x1802aee8U, 332256LL, 548LL, 0x1802b6d7U},
++    {0x1802aee8U, 361301LL, 581LL, 0x1802d123U},
++    {0x1802aee8U, 374378LL, 613LL, 0x1802bf9fU},
++    {0x1802aee8U, 390205LL, 645LL, 0x1802b623U},
++    {0x1802aee8U, 414107LL, 677LL, 0x1802c363U},
++    {0x1802aee8U, 434654LL, 709LL, 0x1802c739U},
++    {0x1802aee8U, 454119LL, 742LL, 0x1802c644U},
++    {0x1802aee8U, 469605LL, 774LL, 0x1802bbbeU},
++    {0x1802aee8U, 484520LL, 806LL, 0x1802afc9U},
++    {0x1802aee8U, 502709LL, 838LL, 0x1802ad02U},
++    {0x1802aee8U, 516713LL, 871LL, 0x18029d4dU},
++    {0x1802aee8U, 531419LL, 903LL, 0x1802915dU},
++    {0x1802aee8U, 547189LL, 935LL, 0x18028864U},
++    {0x1802aee8U, 566460LL, 967LL, 0x18028893U},
++    {0x1802aee8U, 583905LL, 991LL, 0x1802908aU},
++    {0x1802aee8U, 586689LL, 992LL, 0x1802964eU},
++    {0x1802aee8U, 586926LL, 993LL, 0x18029557U},
++    {0x1802aee8U, 587291LL, 994LL, 0x180294b7U},
++    {0x1802aee8U, 587688LL, 995LL, 0x1802942fU},
++    {0x1802aee8U, 587802LL, 996LL, 0x180292e6U},
++    {0x1802aee8U, 588403LL, 997LL, 0x180292e6U},
++    {0x1802aee8U, 588544LL, 998LL, 0x180291b0U},
++    {0x1802aee8U, 589215LL, 999LL, 0x180291e0U},
++    {0x1802aee8U, 589738LL, 1000LL, 0x180291adU},
++    {0x1802aee8U, 1200LL, 1LL, 0x1802aee8U},
++    {0x1802aee8U, 1310LL, 2LL, 0x1802ad91U},
++    {0x1802aee8U, 1327LL, 3LL, 0x1802abf8U},
++    {0x1802aee8U, 1739LL, 4LL, 0x1802ab73U},
++    {0x1802aee8U, 2219LL, 5LL, 0x1802ab20U},
++    {0x1802aee8U, 2604LL, 6LL, 0x1802aa89U},
++    {0x1802aee8U, 2746LL, 7LL, 0x1802a94bU},
++    {0x1802aee8U, 7099LL, 8LL, 0x1802b39cU},
++    {0x1802aee8U, 7099LL, 9LL, 0x1802b1f2U},
++    {0x1802aee8U, 7657LL, 10LL, 0x1802b1d4U},
++    {0x1802aee8U, 14582LL, 33LL, 0x18029f19U},
++    {0x1802aee8U, 18116LL, 65LL, 0x18027642U},
++    {0x1802aee8U, 20213LL, 97LL, 0x18024c74U},
++    {0x1802aee8U, 21686LL, 129LL, 0x18022407U},
++    {0x1802aee8U, 22775LL, 162LL, 0x1801fc5dU},
++    {0x1802aee8U, 24089LL, 194LL, 0x1801d927U},
++    {0x1802aee8U, 25174LL, 226LL, 0x1801b801U},
++    {0x1802aee8U, 25966LL, 258LL, 0x180198b8U},
++    {0x1802aee8U, 26675LL, 291LL, 0x18017a9eU},
++    {0x1802aee8U, 27361LL, 323LL, 0x18015f80U},
++    {0x1802aee8U, 27789LL, 355LL, 0x18014605U},
++    {0x1802aee8U, 28251LL, 387LL, 0x18012e6aU},
++    {0x1802aee8U, 28580LL, 419LL, 0x18011859U},
++    {0x1802aee8U, 29002LL, 452LL, 0x1801035dU},
++    {0x1802aee8U, 29380LL, 484LL, 0x1800f07eU},
++    {0x1802aee8U, 29760LL, 516LL, 0x1800df02U},
++    {0x1802aee8U, 30136LL, 548LL, 0x1800ceceU},
++    {0x1802aee8U, 30632LL, 581LL, 0x1800bf6aU},
++    {0x1802aee8U, 30834LL, 613LL, 0x1800b15dU},
++    {0x1802aee8U, 31069LL, 645LL, 0x1800a45fU},
++    {0x1802aee8U, 31415LL, 677LL, 0x18009867U},
++    {0x1802aee8U, 31692LL, 709LL, 0x18008d41U},
++    {0x1802aee8U, 31943LL, 742LL, 0x18008297U},
++    {0x1802aee8U, 32129LL, 774LL, 0x1778fed7U},
++    {0x1802aee8U, 32302LL, 806LL, 0x17701b77U},
++    {0x1802aee8U, 32505LL, 838LL, 0x1767e37bU},
++    {0x1802aee8U, 32652LL, 871LL, 0x176005b7U},
++    {0x1802aee8U, 32803LL, 903LL, 0x1758f4e3U},
++    {0x1802aee8U, 32958LL, 935LL, 0x17526a0cU},
++    {0x1802aee8U, 33145LL, 967LL, 0x174c5d53U},
++    {0x1802aee8U, 33311LL, 991LL, 0x17481f9fU},
++    {0x1802aee8U, 33338LL, 992LL, 0x1747f55cU},
++    {0x1802aee8U, 33340LL, 993LL, 0x1747c917U},
++    {0x1802aee8U, 33343LL, 994LL, 0x17479cfcU},
++    {0x1802aee8U, 33346LL, 995LL, 0x17477136U},
++    {0x1802aee8U, 33347LL, 996LL, 0x17474546U},
++    {0x1802aee8U, 33353LL, 997LL, 0x174719acU},
++    {0x1802aee8U, 33354LL, 998LL, 0x1746ede7U},
++    {0x1802aee8U, 33360LL, 999LL, 0x1746c2cdU},
++    {0x1802aee8U, 33365LL, 1000LL, 0x17469789U},
++    {0x1802aee8U, 1200LL, 1LL, 0x1802aee8U},
++    {0x1802aee8U, 1310LL, 2LL, 0x1802ad91U},
++    {0x1802aee8U, 1327LL, 3LL, 0x1802abf8U},
++    {0x1802aee8U, 1739LL, 4LL, 0x1802ab73U},
++    {0x1802aee8U, 2219LL, 5LL, 0x1802ab20U},
++    {0x1802aee8U, 2604LL, 6LL, 0x1802aa89U},
++    {0x1802aee8U, 2746LL, 7LL, 0x1802a94bU},
++    {0x1802aee8U, 7099LL, 8LL, 0x1802b39cU},
++    {0x1802aee8U, 7099LL, 9LL, 0x1802b1f2U},
++    {0x1802aee8U, 7657LL, 10LL, 0x1802b1d4U},
++    {0x1802aee8U, 18343LL, 17LL, 0x1802c40eU},
++    {0x1802aee8U, 53537LL, 33LL, 0x1803109dU},
++    {0x1802aee8U, 96126LL, 49LL, 0x18037f7cU},
++    {0x1802aee8U, 145532LL, 65LL, 0x18041a91U},
++    {0x1802aee8U, 188533LL, 81LL, 0x1804b157U},
++    {0x1802aee8U, 317896LL, 97LL, 0x180795e1U},
++    {0x1802aee8U, 408962LL, 113LL, 0x180a84c3U},
++    {0x1802aee8U, 527010LL, 129LL, 0x18103fecU},
++    {0x1802aee8U, 643838LL, 145LL, 0x1818fc3aU},
++    {0x1802aee8U, 769848LL, 161LL, 0x1827db4eU},
++    {0x1802aee8U, 969311LL, 178LL, 0x185525deU},
++    {0x1802aee8U, 1226790LL, 194LL, 0x1900e61eU},
++    {0x1802aee8U, 1431075LL, 210LL, 0x1901f679U},
++    {0x1802aee8U, 1737836LL, 226LL, 0x1906771cU},
++    {0x1802aee8U, 1951261LL, 242LL, 0x190ea482U},
++    {0x1802aee8U, 2236381LL, 258LL, 0x192c398bU},
++    {0x1802aee8U, 2445886LL, 274LL, 0x19629bceU},
++    {0x1802aee8U, 2771080LL, 290LL, 0x1a015db3U},
++    {0x1802aee8U, 3169530LL, 306LL, 0x1a067fb4U},
++    {0x1802aee8U, 3462640LL, 322LL, 0x1a14441aU},
++    {0x1802aee8U, 3728004LL, 339LL, 0x1a386444U},
++    {0x1802aee8U, 4011072LL, 355LL, 0x1b00a8e9U},
++    {0x1802aee8U, 4279774LL, 371LL, 0x1b01dd82U},
++    {0x1802aee8U, 4691875LL, 387LL, 0x1b096030U},
++    {0x1802aee8U, 4924277LL, 403LL, 0x1b16eaa0U},
++    {0x1802aee8U, 5264121LL, 419LL, 0x1b562e80U},
++    {0x1802aee8U, 5709375LL, 435LL, 0x1c01eeacU},
++    {0x1802aee8U, 6094989LL, 451LL, 0x1c08bbacU},
++    {0x1802aee8U, 6431467LL, 467LL, 0x1c206707U},
++    {0x1802aee8U, 6930238LL, 483LL, 0x1d00e688U},
++    {0x1802aee8U, 7216733LL, 491LL, 0x1d00ffffU},
++    {0x1802aee8U, 7226083LL, 492LL, 0x1d00ffffU},
++    {0x1802aee8U, 7284983LL, 493LL, 0x1d00ffffU},
++    {0x1802aee8U, 7290833LL, 494LL, 0x1d00ffffU},
++    {0x1802aee8U, 7293683LL, 495LL, 0x1d00ffffU},
++    {0x1802aee8U, 7343383LL, 496LL, 0x1d00ffffU},
++    {0x1802aee8U, 7387333LL, 497LL, 0x1d00ffffU},
++    {0x1802aee8U, 7388383LL, 498LL, 0x1d00ffffU},
++    {0x1802aee8U, 7421433LL, 499LL, 0x1d00ffffU},
++    {0x1802aee8U, 7462933LL, 500LL, 0x1d00ffffU},
++    {0x1802aee8U, 900LL, 1LL, 0x1802ae16U},
++    {0x1802aee8U, 1200LL, 2LL, 0x1802ad44U},
++    {0x1802aee8U, 1500LL, 3LL, 0x1802ac71U},
++    {0x1802aee8U, 1800LL, 4LL, 0x1802ab9eU},
++    {0x1802aee8U, 2100LL, 5LL, 0x1802aacdU},
++    {0x1802aee8U, 2400LL, 6LL, 0x1802a9faU},
++    {0x1802aee8U, 2700LL, 7LL, 0x1802a929U},
++    {0x1802aee8U, 3000LL, 8LL, 0x1802a858U},
++    {0x1802aee8U, 3300LL, 9LL, 0x1802a787U},
++    {0x1802aee8U, 3600LL, 10LL, 0x1802a6b7U},
++    {0x1802aee8U, 1500LL, 1LL, 0x1802afbbU},
++    {0x1802aee8U, 2400LL, 2LL, 0x1802b08fU},
++    {0x1802aee8U, 3300LL, 3LL, 0x1802b166U},
++    {0x1802aee8U, 4200LL, 4LL, 0x1802b23aU},
++    {0x1802aee8U, 5100LL, 5LL, 0x1802b30eU},
++    {0x1802aee8U, 6000LL, 6LL, 0x1802b3e5U},
++    {0x1802aee8U, 6900LL, 7LL, 0x1802b4bbU},
++    {0x1802aee8U, 7800LL, 8LL, 0x1802b592U},
++    {0x1802aee8U, 8700LL, 9LL, 0x1802b669U},
++    {0x1802aee8U, 9600LL, 10LL, 0x1802b73dU},
++    {0x1802aee8U, 1200LL, 1LL, 0x1802aee8U},
++    {0x1802aee8U, 1496LL, 2LL, 0x1802ae12U},
++    {0x1802aee8U, 1398LL, 3LL, 0x1802ac28U},
++    {0x1802aee8U, 1996LL, 4LL, 0x1802ac28U},
++    {0x1802aee8U, 1731LL, 5LL, 0x1802a9cbU},
++    {0x1802aee8U, 1816LL, 6LL, 0x1802a863U},
++    {0x1802aee8U, 2113LL, 7LL, 0x1802a790U},
++    {0x1802aee8U, 2318LL, 8LL, 0x1802a67eU},
++    {0x1802aee8U, 2679LL, 9LL, 0x1802a5d7U},
++    {0x1802aee8U, 3289LL, 10LL, 0x1802a5dfU},
++    {0x1802aee8U, 9614LL, 33LL, 0x180291e0U},
++    {0x1802aee8U, 18236LL, 65LL, 0x18027690U},
++    {0x1802aee8U, 30215LL, 97LL, 0x1802648eU},
++    {0x1802aee8U, 36477LL, 129LL, 0x18024590U},
++    {0x1802aee8U, 44850LL, 162LL, 0x18022b7bU},
++    {0x1802aee8U, 58132LL, 194LL, 0x18021e6fU},
++    {0x1802aee8U, 68739LL, 226LL, 0x18020c09U},
++    {0x1802aee8U, 75698LL, 258LL, 0x1801f2e9U},
++    {0x1802aee8U, 86668LL, 291LL, 0x1801e18bU},
++    {0x1802aee8U, 95785LL, 323LL, 0x1801ce75U},
++    {0x1802aee8U, 106385LL, 355LL, 0x1801bec7U},
++    {0x1802aee8U, 115625LL, 387LL, 0x1801ad4cU},
++    {0x1802aee8U, 129600LL, 419LL, 0x1801a466U},
++    {0x1802aee8U, 140651LL, 452LL, 0x180195ecU},
++    {0x1802aee8U, 147949LL, 484LL, 0x18018304U},
++    {0x1802aee8U, 156150LL, 516LL, 0x18017253U},
++    {0x1802aee8U, 165458LL, 548LL, 0x180163e9U},
++    {0x1802aee8U, 175478LL, 581LL, 0x18015631U},
++    {0x1802aee8U, 185070LL, 613LL, 0x18014946U},
++    {0x1802aee8U, 195032LL, 645LL, 0x18013d4eU},
++    {0x1802aee8U, 206209LL, 677LL, 0x18013342U},
++    {0x1802aee8U, 215533LL, 709LL, 0x18012751U},
++    {0x1802aee8U, 223762LL, 742LL, 0x180119e9U},
++    {0x1802aee8U, 231050LL, 774LL, 0x18010cbeU},
++    {0x1802aee8U, 237126LL, 806LL, 0x1800fef2U},
++    {0x1802aee8U, 246190LL, 838LL, 0x1800f4c9U},
++    {0x1802aee8U, 258786LL, 871LL, 0x1800edcfU},
++    {0x1802aee8U, 267091LL, 903LL, 0x1800e3a5U},
++    {0x1802aee8U, 274465LL, 935LL, 0x1800d91bU},
++    {0x1802aee8U, 285234LL, 967LL, 0x1800d1e4U},
++    {0x1802aee8U, 292311LL, 991LL, 0x1800cbd3U},
++    {0x1802aee8U, 292068LL, 992LL, 0x1800cb22U},
++    {0x1802aee8U, 292691LL, 993LL, 0x1800cb28U},
++    {0x1802aee8U, 293156LL, 994LL, 0x1800cb0cU},
++    {0x1802aee8U, 292897LL, 995LL, 0x1800ca59U},
++    {0x1802aee8U, 293056LL, 996LL, 0x1800c9fdU},
++    {0x1802aee8U, 293558LL, 997LL, 0x1800c9e9U},
++    {0x1802aee8U, 293356LL, 998LL, 0x1800c943U},
++    {0x1802aee8U, 293956LL, 999LL, 0x1800c943U},
++    {0x1802aee8U, 293713LL, 1000LL, 0x1800c896U},
++    {0x1802aee8U, 1200LL, 1LL, 0x1802aee8U},
++    {0x1802aee8U, 1199LL, 2LL, 0x1802ad44U},
++    {0x1802aee8U, 1198LL, 3LL, 0x1802ab9eU},
++    {0x1802aee8U, 1197LL, 4LL, 0x1802a9f9U},
++    {0x1802aee8U, 1196LL, 5LL, 0x1802a855U},
++    {0x1802aee8U, 1195LL, 6LL, 0x1802a6b3U},
++    {0x1802aee8U, 1194LL, 7LL, 0x1802a511U},
++    {0x1802aee8U, 1193LL, 8LL, 0x1802a371U},
++    {0x1802aee8U, 1192LL, 9LL, 0x1802a1d1U},
++    {0x1802aee8U, 1191LL, 10LL, 0x1802a033U},
++    {0x1802aee8U, 878LL, 323LL, 0x18013c18U},
++    {0x1802aee8U, 555LL, 646LL, 0x18009116U},
++    {0x1802aee8U, 233LL, 968LL, 0x1742c04dU},
++    {0x1802aee8U, -90LL, 1291LL, 0x171ea33dU},
++    {0x1802aee8U, -412LL, 1613LL, 0x170e18dbU},
++    {0x1802aee8U, -735LL, 1936LL, 0x170678a4U},
++    {0x1802aee8U, -1057LL, 2258LL, 0x1702fa51U},
++    {0x1802aee8U, -1380LL, 2581LL, 0x17015de6U},
++    {0x1802aee8U, -1702LL, 2903LL, 0x1700a100U},
++    {0x1802aee8U, -2025LL, 3226LL, 0x1649e6c4U},
++    {0x1802aee8U, -2348LL, 3549LL, 0x1621eb2dU},
++    {0x1802aee8U, -2670LL, 3871LL, 0x160f9afdU},
++    {0x1802aee8U, -2993LL, 4194LL, 0x160729bcU},
++    {0x1802aee8U, -3315LL, 4516LL, 0x16034bcdU},
++    {0x1802aee8U, -3638LL, 4839LL, 0x16018359U},
++    {0x1802aee8U, -3960LL, 5161LL, 0x1600b23aU},
++    {0x1802aee8U, -4283LL, 5484LL, 0x1551ceedU},
++    {0x1802aee8U, -4605LL, 5806LL, 0x1525a464U},
++    {0x1802aee8U, -4928LL, 6129LL, 0x151146e1U},
++    {0x1802aee8U, -5250LL, 6451LL, 0x1507f2e4U},
++    {0x1802aee8U, -5573LL, 6774LL, 0x1503a603U},
++    {0x1802aee8U, -5896LL, 7097LL, 0x1501acbeU},
++    {0x1802aee8U, -6218LL, 7419LL, 0x1500c54bU},
++    {0x1802aee8U, -6541LL, 7742LL, 0x145a9017U},
++    {0x1802aee8U, -6863LL, 8064LL, 0x1429ab16U},
++    {0x1802aee8U, -7186LL, 8387LL, 0x14132083U},
++    {0x1802aee8U, -7508LL, 8709LL, 0x1408ccd7U},
++    {0x1802aee8U, -7831LL, 9032LL, 0x140409fcU},
++    {0x1802aee8U, -8153LL, 9354LL, 0x1401dbbdU},
++    {0x1802aee8U, -8476LL, 9677LL, 0x1400da61U},
++    {0x1802aee8U, -8790LL, 9991LL, 0x136671ddU},
++    {0x1802aee8U, -8791LL, 9992LL, 0x136632cfU},
++    {0x1802aee8U, -8792LL, 9993LL, 0x1365f3c1U},
++    {0x1802aee8U, -8793LL, 9994LL, 0x1365b508U},
++    {0x1802aee8U, -8794LL, 9995LL, 0x13657650U},
++    {0x1802aee8U, -8795LL, 9996LL, 0x136537edU},
++    {0x1802aee8U, -8796LL, 9997LL, 0x1364f98bU},
++    {0x1802aee8U, -8797LL, 9998LL, 0x1364bb7eU},
++    {0x1802aee8U, -8798LL, 9999LL, 0x13647d71U},
++    {0x1802aee8U, -8799LL, 10000LL, 0x13643f64U},
++};
++#endif
+diff --git a/src/test/daa_common_tests.cpp b/src/test/daa_common_tests.cpp
+--- a/src/test/daa_common_tests.cpp
++++ b/src/test/daa_common_tests.cpp
+@@ -31,7 +31,7 @@
+     const int h = *p.DAAHeight;
+     BOOST_CHECK(!daa::Active(p, h - 1));
+     BOOST_CHECK(daa::Active(p, h));
+-    for (int n = h; n < h + 433; ++n) BOOST_CHECK_EQUAL(daa::Retarget(p, n), n > h && (n - h) % 144 == 0);
++    for (int n = h; n < h + 433; ++n) BOOST_CHECK_EQUAL(daa::Retarget(p, n), n > h);
+ }
+ 
+ BOOST_AUTO_TEST_CASE(overflow_safe_scaling)
+diff --git a/src/test/daa_tests.cpp b/src/test/daa_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/test/daa_tests.cpp
+@@ -0,0 +1,155 @@
++// Copyright (c) 2026 The eCash developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <chain.h>
++#include <chainparams.h>
++#include <daa_algorithm.h>
++#include <headerssync.h>
++#include <pow.h>
++#include <test/daa_vectors.h>
++#include <test/daa_asert_vectors.h>
++#include <test/util/setup_common.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <span>
++#include <vector>
++
++namespace {
++struct Chain {
++    std::vector<CBlockIndex> blocks;
++    std::vector<uint256> hashes;
++    std::vector<CBlockHeader> headers;
++    Chain(const Consensus::Params& params, int count, int spacing) : blocks(count), hashes(count), headers(count)
++    {
++        for (int i = 0; i < count; ++i) {
++            auto& b = blocks[i];
++            b.nHeight = i;
++            b.nVersion = 4;
++            b.pprev = i ? &blocks[i-1] : nullptr;
++            b.nTime = 1'600'000'000 + i*spacing;
++            CBlockHeader candidate;
++            candidate.nTime = b.nTime;
++            b.nBits = i ? GetNextWorkRequired(b.pprev, &candidate, params) : 0x207fffff;
++            b.nChainWork = (i ? blocks[i-1].nChainWork : arith_uint256{0}) + GetBlockProof(b);
++            b.BuildSkip();
++            hashes[i] = b.GetBlockHeader().GetHash();
++            b.phashBlock = &hashes[i];
++            headers[i] = b.GetBlockHeader();
++        }
++    }
++};
++Consensus::Params TestParams(int height = daa::REGTEST_HEIGHT)
++{
++    CChainParams::RegTestOptions opts;
++    opts.test_daa = true;
++    auto params = CChainParams::RegTest(opts)->GetConsensus();
++    params.DAAHeight = height;
++    return params;
++}
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(daa_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(deterministic_reference_vectors)
++{
++    const auto params = TestParams();
++    for (const auto& v : DAA_VECTORS) {
++        BOOST_TEST_CONTEXT("bits=" << v.bits << " seconds=" << v.seconds << " heights=" << v.heights) {
++            BOOST_CHECK_EQUAL(daa::CalculateTarget(v.bits, v.seconds, v.heights, params.powLimit), v.expected);
++            BOOST_CHECK(DeriveTarget(v.expected, params.powLimit));
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(published_asert_vectors)
++{
++    const uint256 limit = ArithToUint256(arith_uint256{}.SetCompact(0x1d00ffff));
++    for (const auto& v : ASERT_VECTORS) {
++        BOOST_TEST_CONTEXT("published bits=" << v.bits << " seconds=" << v.seconds << " heights=" << v.heights) {
++            BOOST_CHECK_EQUAL(daa::CalculateTarget(v.bits, v.seconds, v.heights, limit), v.expected);
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(two_day_halflife)
++{
++    const auto params = TestParams();
++    BOOST_CHECK_EQUAL(daa::CalculateTarget(0x1c123456, 600, 0, params.powLimit), 0x1c123456);
++    BOOST_CHECK_EQUAL(daa::CalculateTarget(0x1c123456, 600+172800, 0, params.powLimit), 0x1c2468ac);
++    BOOST_CHECK_EQUAL(daa::CalculateTarget(0x1c123456, 600-172800, 0, params.powLimit), 0x1c091a2b);
++}
++
++BOOST_AUTO_TEST_CASE(activation_and_per_block_adjustments)
++{
++    for (const int h : {2, 200, 288, 2016}) {
++        const auto params = TestParams(h);
++        Chain c{params, h+290, 300};
++        for (int n = 0; n <= h; ++n) BOOST_CHECK_EQUAL(c.blocks[n].nBits, 0x207fffff);
++        BOOST_CHECK_EQUAL(c.blocks[h+1].nBits, DAA_FIRST_FAST_BITS);
++        for (int r = 1; r < 290; ++r) {
++            const auto expected = daa::CalculateTarget(0x207fffff, (r+1)*300, r, params.powLimit);
++            BOOST_CHECK_EQUAL(c.blocks[h+r].nBits, expected);
++        }
++        auto& last = c.blocks[h+143];
++        const auto median = last.GetMedianTimePast();
++        last.nTime -= 400;
++        BOOST_CHECK_LT(last.nTime, last.pprev->nTime);
++        BOOST_CHECK_GT(last.GetBlockTime(), last.pprev->GetMedianTimePast());
++        BOOST_CHECK_EQUAL(last.GetMedianTimePast(), median);
++        const auto expected = daa::CalculateTarget(0x207fffff, 145*300-400, 144, params.powLimit);
++        BOOST_CHECK_EQUAL(daa::GetWorkRequired(last, params), expected);
++        // The timestamp reference is the anchor's parent, not the anchor.
++        c.blocks[h-1].nTime += 1000;
++        BOOST_CHECK_EQUAL(daa::GetWorkRequired(last, params), expected);
++        c.blocks[h-2].nTime += 1000;
++        BOOST_CHECK_EQUAL(daa::GetWorkRequired(last, params), daa::CalculateTarget(0x207fffff, 145*300-1400, 144, params.powLimit));
++    }
++}
++
++BOOST_AUTO_TEST_CASE(transition_checks_and_regtest_escape_is_disabled)
++{
++    const auto params = TestParams();
++    Chain c{params, 345, 300};
++    CBlockHeader late, normal;
++    late.nTime = c.blocks[344].nTime + 100'000;
++    normal.nTime = c.blocks[344].nTime + 300;
++    const auto expected = daa::GetWorkRequired(c.blocks[344], params);
++    BOOST_CHECK_EQUAL(GetNextWorkRequired(&c.blocks[344], &late, params), expected);
++    BOOST_CHECK_EQUAL(GetNextWorkRequired(&c.blocks[344], &normal, params), expected);
++    BOOST_CHECK_NE(expected, 0x207fffff);
++    BOOST_CHECK(PermittedDifficultyTransition(params, 201, c.blocks[200].nBits, c.blocks[201].nBits));
++    BOOST_CHECK(!PermittedDifficultyTransition(params, 200, c.blocks[199].nBits, c.blocks[199].nBits-1));
++    for (uint32_t invalid : {0U, 0x20800001U, 0x23000001U, 0x2100ffffU})
++        BOOST_CHECK(!PermittedDifficultyTransition(params, 201, c.blocks[200].nBits, invalid));
++    const uint32_t harder = daa::CalculateTarget(0x207fffff, 0, 5000, params.powLimit);
++    BOOST_CHECK(PermittedDifficultyTransition(params, 201, 0x207fffff, harder));
++}
++
++BOOST_AUTO_TEST_CASE(headers_presync_and_redownload_across_activation)
++{
++    const auto params = TestParams();
++    Chain c{params, 701, 300};
++    for (const int start : {0, 198, 199, 200, 217, 400}) {
++        HeadersSyncState state{0, params, HeadersSyncParams{17, 32}, c.blocks[start], c.blocks.back().nChainWork};
++        const auto headers = std::span{c.headers}.subspan(start+1);
++        const auto first = state.ProcessNextHeaders(headers, true);
++        BOOST_REQUIRE(first.success);
++        BOOST_REQUIRE(state.GetState() == HeadersSyncState::State::REDOWNLOAD);
++        const auto second = state.ProcessNextHeaders(headers, true);
++        BOOST_REQUIRE(second.success);
++        BOOST_CHECK_EQUAL(second.pow_validated_headers.size(), headers.size());
++    }
++    if (DAA_ANCHORED) {
++        auto bad = c.headers;
++        bad[344].nBits -= 1; // valid target, wrong anchored result
++        HeadersSyncState presync{0, params, HeadersSyncParams{17,32}, c.blocks[0], c.blocks.back().nChainWork};
++        BOOST_CHECK(!presync.ProcessNextHeaders(std::span{bad}.subspan(1), true).success);
++        HeadersSyncState redownload{0, params, HeadersSyncParams{17,32}, c.blocks[0], c.blocks.back().nChainWork};
++        BOOST_REQUIRE(redownload.ProcessNextHeaders(std::span{c.headers}.subspan(1), true).success);
++        BOOST_CHECK(!redownload.ProcessNextHeaders(std::span{bad}.subspan(1), true).success);
++    }
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/daa_vectors.h b/src/test/daa_vectors.h
+new file mode 100644
+--- /dev/null
++++ b/src/test/daa_vectors.h
+@@ -0,0 +1,246 @@
++// Generated from the independent Python integer specification; also checked
++// against a 120-digit Decimal oracle. Regenerate with contrib/daa_reference.py.
++#ifndef BITCOIN_TEST_DAA_VECTORS_H
++#define BITCOIN_TEST_DAA_VECTORS_H
++#include <cstdint>
++#include <limits>
++struct DAAVector { uint32_t bits; int64_t seconds; int64_t heights; uint32_t expected; };
++inline constexpr DAAVector DAA_VECTORS[]{
++    {0x207fffffU, -1000000LL, 144LL, 0x2001a2a2U},
++    {0x207fffffU, 0LL, 144LL, 0x205a48ffU},
++    {0x207fffffU, 21599LL, 144LL, 0x2062763fU},
++    {0x207fffffU, 21600LL, 144LL, 0x2062763fU},
++    {0x207fffffU, 21601LL, 144LL, 0x2062763fU},
++    {0x207fffffU, 43199LL, 144LL, 0x206b623fU},
++    {0x207fffffU, 43200LL, 144LL, 0x206b623fU},
++    {0x207fffffU, 86399LL, 144LL, 0x207fb1bfU},
++    {0x207fffffU, 86400LL, 144LL, 0x207fb1bfU},
++    {0x207fffffU, 86401LL, 144LL, 0x207fb1bfU},
++    {0x207fffffU, 212305LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 212306LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 212307LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 345599LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 345600LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 345601LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 9223372036854775807LL, 144LL, 0x207fffffU},
++    {0x207fffffU, std::numeric_limits<int64_t>::min(), 144LL, 0x01010000U},
++    {0x1c123456U, -1000000LL, 144LL, 0x1b3b8a17U},
++    {0x1c123456U, 0LL, 144LL, 0x1c0cd72eU},
++    {0x1c123456U, 21599LL, 144LL, 0x1c0e00e3U},
++    {0x1c123456U, 21600LL, 144LL, 0x1c0e00e3U},
++    {0x1c123456U, 21601LL, 144LL, 0x1c0e00e3U},
++    {0x1c123456U, 43199LL, 144LL, 0x1c0f45b9U},
++    {0x1c123456U, 43200LL, 144LL, 0x1c0f45b9U},
++    {0x1c123456U, 86399LL, 144LL, 0x1c122935U},
++    {0x1c123456U, 86400LL, 144LL, 0x1c122935U},
++    {0x1c123456U, 86401LL, 144LL, 0x1c122935U},
++    {0x1c123456U, 212305LL, 144LL, 0x1c1e183eU},
++    {0x1c123456U, 212306LL, 144LL, 0x1c1e183eU},
++    {0x1c123456U, 212307LL, 144LL, 0x1c1e183eU},
++    {0x1c123456U, 345599LL, 144LL, 0x1c335c94U},
++    {0x1c123456U, 345600LL, 144LL, 0x1c335c94U},
++    {0x1c123456U, 345601LL, 144LL, 0x1c335c94U},
++    {0x1c123456U, 9223372036854775807LL, 144LL, 0x207fffffU},
++    {0x1c123456U, std::numeric_limits<int64_t>::min(), 144LL, 0x01010000U},
++    {0x01010000U, -1000000LL, 144LL, 0x01010000U},
++    {0x01010000U, 0LL, 144LL, 0x01010000U},
++    {0x01010000U, 21599LL, 144LL, 0x01010000U},
++    {0x01010000U, 21600LL, 144LL, 0x01010000U},
++    {0x01010000U, 21601LL, 144LL, 0x01010000U},
++    {0x01010000U, 43199LL, 144LL, 0x01010000U},
++    {0x01010000U, 43200LL, 144LL, 0x01010000U},
++    {0x01010000U, 86399LL, 144LL, 0x01010000U},
++    {0x01010000U, 86400LL, 144LL, 0x01010000U},
++    {0x01010000U, 86401LL, 144LL, 0x01010000U},
++    {0x01010000U, 212305LL, 144LL, 0x01010000U},
++    {0x01010000U, 212306LL, 144LL, 0x01010000U},
++    {0x01010000U, 212307LL, 144LL, 0x01010000U},
++    {0x01010000U, 345599LL, 144LL, 0x01020000U},
++    {0x01010000U, 345600LL, 144LL, 0x01020000U},
++    {0x01010000U, 345601LL, 144LL, 0x01020000U},
++    {0x01010000U, 9223372036854775807LL, 144LL, 0x207fffffU},
++    {0x01010000U, std::numeric_limits<int64_t>::min(), 144LL, 0x01010000U},
++    {0x02008000U, -1000000LL, 144LL, 0x01010000U},
++    {0x02008000U, 0LL, 144LL, 0x015a0000U},
++    {0x02008000U, 21599LL, 144LL, 0x01620000U},
++    {0x02008000U, 21600LL, 144LL, 0x01620000U},
++    {0x02008000U, 21601LL, 144LL, 0x01620000U},
++    {0x02008000U, 43199LL, 144LL, 0x016b0000U},
++    {0x02008000U, 43200LL, 144LL, 0x016b0000U},
++    {0x02008000U, 86399LL, 144LL, 0x017f0000U},
++    {0x02008000U, 86400LL, 144LL, 0x017f0000U},
++    {0x02008000U, 86401LL, 144LL, 0x017f0000U},
++    {0x02008000U, 212305LL, 144LL, 0x0200d300U},
++    {0x02008000U, 212306LL, 144LL, 0x0200d300U},
++    {0x02008000U, 212307LL, 144LL, 0x0200d300U},
++    {0x02008000U, 345599LL, 144LL, 0x02016900U},
++    {0x02008000U, 345600LL, 144LL, 0x02016900U},
++    {0x02008000U, 345601LL, 144LL, 0x02016900U},
++    {0x02008000U, 9223372036854775807LL, 144LL, 0x207fffffU},
++    {0x02008000U, std::numeric_limits<int64_t>::min(), 144LL, 0x01010000U},
++    {0x207fffffU, 6085994LL, 22524LL, 0x1b10170fU},
++    {0x207fffffU, 7835665LL, 14874LL, 0x20019ebaU},
++    {0x207fffffU, 8444387LL, 7933LL, 0x207fffffU},
++    {0x207fffffU, 3049289LL, 12742LL, 0x1d151b9fU},
++    {0x1c123456U, 7153782LL, 29821LL, 0x1441a961U},
++    {0x207fffffU, 1788376LL, 9375LL, 0x1e01bbddU},
++    {0x1c123456U, 8366484LL, 5487LL, 0x2002ec6dU},
++    {0x207fffffU, 718777LL, 24624LL, 0x16326d5fU},
++    {0x207fffffU, 5813621LL, 21180LL, 0x1c00890fU},
++    {0x207fffffU, 6120729LL, 29139LL, 0x1825cd5fU},
++    {0x1c123456U, -1350946LL, 6637LL, 0x1827f0ebU},
++    {0x1c123456U, 9513949LL, 20128LL, 0x1a28d49eU},
++    {0x1c123456U, -867411LL, 7976LL, 0x180b11e2U},
++    {0x1c123456U, 8832279LL, 5557LL, 0x20100150U},
++    {0x207fffffU, 2175907LL, 23221LL, 0x1807c847U},
++    {0x1c123456U, -357394LL, 9741LL, 0x1801395fU},
++    {0x1c123456U, 1109592LL, 12812LL, 0x1745749dU},
++    {0x207fffffU, 6402068LL, 10717LL, 0x2072143fU},
++    {0x207fffffU, 9278061LL, 8054LL, 0x207fffffU},
++    {0x207fffffU, -2476518LL, 15584LL, 0x1805deffU},
++    {0x1c123456U, -2021472LL, 17359LL, 0x1312826aU},
++    {0x207fffffU, 3930815LL, 10902LL, 0x1f00ed40U},
++    {0x1c123456U, 2000399LL, 29858LL, 0x11010faaU},
++    {0x1c123456U, 2097675LL, 20804LL, 0x15010fbfU},
++    {0x207fffffU, 8511522LL, 5323LL, 0x207fffffU},
++    {0x1c123456U, 6607681LL, 1081LL, 0x2065b0eaU},
++    {0x1c123456U, -138551LL, 19396LL, 0x14010616U},
++    {0x1c123456U, 1470902LL, 14083LL, 0x170de2ceU},
++    {0x207fffffU, 4076375LL, 11876LL, 0x1e28ccbfU},
++    {0x207fffffU, -2372503LL, 8275LL, 0x1b172adfU},
++    {0x207fffffU, 2300458LL, 26707LL, 0x1700bee5U},
++    {0x1c123456U, 9528257LL, 20130LL, 0x1a2b083eU},
++    {0x207fffffU, -1863958LL, 16667LL, 0x18050e77U},
++    {0x207fffffU, 9617936LL, 8291LL, 0x207fffffU},
++    {0x1c123456U, 3217038LL, 7402LL, 0x1b22439fU},
++    {0x207fffffU, 944895LL, 19937LL, 0x19009710U},
++    {0x1c123456U, -1920979LL, 3173LL, 0x19423355U},
++    {0x207fffffU, 2402101LL, 7517LL, 0x1f06f337U},
++    {0x207fffffU, -2733987LL, 2932LL, 0x1d1fdfbfU},
++    {0x207fffffU, 5071272LL, 12118LL, 0x1f04d0dfU},
++    {0x207fffffU, 8281351LL, 23833LL, 0x1c11f8cfU},
++    {0x1c123456U, -2302858LL, 5255LL, 0x181868e2U},
++    {0x1c123456U, -172331LL, 16568LL, 0x150327a2U},
++    {0x1c123456U, 4277783LL, 2026LL, 0x1e3bdeb6U},
++    {0x1c123456U, 6187771LL, 24243LL, 0x160e11c6U},
++    {0x1c123456U, 5169952LL, 14337LL, 0x1a013fa7U},
++    {0x1c123456U, 1845703LL, 9387LL, 0x194d3010U},
++    {0x1c123456U, -1795459LL, 25815LL, 0x10011d6fU},
++    {0x207fffffU, 6694396LL, 26243LL, 0x1a06210fU},
++    {0x1c123456U, -354315LL, 9422LL, 0x1802aba4U},
++    {0x207fffffU, 3910624LL, 843LL, 0x207fffffU},
++    {0x207fffffU, 8853182LL, 2450LL, 0x207fffffU},
++    {0x207fffffU, 4474979LL, 10853LL, 0x1f094007U},
++    {0x207fffffU, 9140583LL, 12157LL, 0x207fffffU},
++    {0x207fffffU, -1246993LL, 3771LL, 0x1e066fe7U},
++    {0x1c123456U, 9376729LL, 6121LL, 0x2024930dU},
++    {0x1c123456U, -244965LL, 9277LL, 0x1805de98U},
++    {0x207fffffU, -1387633LL, 20852LL, 0x165e933fU},
++    {0x207fffffU, 1496826LL, 29730LL, 0x150158c1U},
++    {0x207fffffU, 1388621LL, 3154LL, 0x2010ed6fU},
++    {0x1c123456U, -1976852LL, 26454LL, 0x0f1d9edbU},
++    {0x207fffffU, 9289134LL, 17952LL, 0x1f559b3fU},
++    {0x1c123456U, 7789782LL, 22192LL, 0x18127808U},
++    {0x1c123456U, 873341LL, 24085LL, 0x1230c7acU},
++    {0x1c123456U, -2608272LL, 26223LL, 0x0f041a5aU},
++    {0x1c123456U, 6034765LL, 6915LL, 0x1e0088cbU},
++    {0x207fffffU, 3218257LL, 26951LL, 0x171075efU},
++    {0x207fffffU, -2585569LL, 15263LL, 0x180835afU},
++    {0x207fffffU, -883444LL, 10600LL, 0x1b21cabfU},
++    {0x207fffffU, 3826499LL, 10883LL, 0x1f00a368U},
++    {0x207fffffU, 6151623LL, 12550LL, 0x200081c6U},
++    {0x1c123456U, 9329388LL, 22712LL, 0x1909ed39U},
++    {0x1c123456U, 8514107LL, 889LL, 0x207fffffU},
++    {0x1c123456U, 2264985LL, 22496LL, 0x14090ee5U},
++    {0x207fffffU, 1254156LL, 5783LL, 0x1f0483c3U},
++    {0x207fffffU, 3414917LL, 28485LL, 0x1700e726U},
++    {0x1c123456U, 6896260LL, 27174LL, 0x15355973U},
++    {0x207fffffU, -1883025LL, 3356LL, 0x1e015cdbU},
++    {0x207fffffU, 4358920LL, 12840LL, 0x1e0c73efU},
++    {0x207fffffU, -1183603LL, 5410LL, 0x1d2921bfU},
++    {0x1c123456U, -2561745LL, 11861LL, 0x15120c8cU},
++    {0x207fffffU, -1417780LL, 16438LL, 0x18348b5fU},
++    {0x1c123456U, 8375959LL, 14651LL, 0x1c03711aU},
++    {0x207fffffU, 6727515LL, 19063LL, 0x1d0d57d7U},
++    {0x1c123456U, 4695841LL, 26132LL, 0x14189db8U},
++    {0x207fffffU, 1254420LL, 26241LL, 0x1608d2ffU},
++    {0x207fffffU, -2566828LL, 27725LL, 0x1300eac0U},
++    {0x207fffffU, -837830LL, 28803LL, 0x134668ffU},
++    {0x207fffffU, 7046972LL, 28602LL, 0x191615bfU},
++    {0x207fffffU, 8418535LL, 7980LL, 0x207fffffU},
++    {0x1c123456U, 8485627LL, 25074LL, 0x174ae7d0U},
++    {0x1c123456U, -2870185LL, 3484LL, 0x1900b1fdU},
++    {0x207fffffU, 41445LL, 25538LL, 0x155e877fU},
++    {0x207fffffU, 7340249LL, 10396LL, 0x207fffffU},
++    {0x207fffffU, -1602372LL, 22684LL, 0x157c7a3fU},
++    {0x207fffffU, 2026589LL, 27009LL, 0x161ec48fU},
++    {0x207fffffU, 2372067LL, 12697LL, 0x1d018e15U},
++    {0x1c123456U, 5221240LL, 29126LL, 0x13267db8U},
++    {0x207fffffU, 5490898LL, 4532LL, 0x207fffffU},
++    {0x1c123456U, 20540LL, 5378LL, 0x1a031730U},
++    {0x207fffffU, 3458917LL, 24801LL, 0x181dd60fU},
++    {0x207fffffU, 6806837LL, 15356LL, 0x1f0218f3U},
++    {0x1c123456U, 9646400LL, 25277LL, 0x1812e3faU},
++    {0x1c123456U, 7730599LL, 20750LL, 0x1901d458U},
++    {0x1c123456U, 2569944LL, 14821LL, 0x1800c119U},
++    {0x1c123456U, 2234178LL, 20135LL, 0x15092eb8U},
++    {0x207fffffU, 9678170LL, 26838LL, 0x1c038615U},
++    {0x1c123456U, 2961248LL, 6593LL, 0x1b560fa2U},
++    {0x1c123456U, 1735444LL, 3030LL, 0x1c0d0a46U},
++    {0x1c123456U, 8749713LL, 7063LL, 0x1f4e70a1U},
++    {0x207fffffU, 6804712LL, 29516LL, 0x1900ed27U},
++    {0x1c123456U, 9482852LL, 13162LL, 0x1d290b3bU},
++    {0x207fffffU, 6968670LL, 13578LL, 0x200121c4U},
++    {0x1c123456U, 6823675LL, 21842LL, 0x1800e3c0U},
++    {0x207fffffU, 9133298LL, 24708LL, 0x1c42b47fU},
++    {0x207fffffU, 9548396LL, 10524LL, 0x207fffffU},
++    {0x1c123456U, 9119967LL, 8597LL, 0x1f08a1e6U},
++    {0x207fffffU, 7733022LL, 11307LL, 0x207fffffU},
++    {0x1c123456U, 296315LL, 21541LL, 0x130896dcU},
++    {0x1c123456U, 3300742LL, 19930LL, 0x16043caaU},
++    {0x207fffffU, -309657600LL, 0LL, 0x01010000U},
++    {0x207fffffU, -1000000LL, 0LL, 0x2002500dU},
++    {0x207fffffU, -1LL, 0LL, 0x207fb1bfU},
++    {0x207fffffU, 0LL, 0LL, 0x207fb1bfU},
++    {0x207fffffU, 1LL, 0LL, 0x207fb1bfU},
++    {0x207fffffU, 1000000LL, 0LL, 0x207fffffU},
++    {0x207fffffU, 309657600LL, 0LL, 0x207fffffU},
++    {0x207fffffU, -309657000LL, 1LL, 0x01010000U},
++    {0x207fffffU, -999400LL, 1LL, 0x2002500dU},
++    {0x207fffffU, 599LL, 1LL, 0x207fb1bfU},
++    {0x207fffffU, 600LL, 1LL, 0x207fb1bfU},
++    {0x207fffffU, 601LL, 1LL, 0x207fb1bfU},
++    {0x207fffffU, 1000600LL, 1LL, 0x207fffffU},
++    {0x207fffffU, 309658200LL, 1LL, 0x207fffffU},
++    {0x207fffffU, -309571200LL, 144LL, 0x01010000U},
++    {0x207fffffU, -913600LL, 144LL, 0x2002500dU},
++    {0x207fffffU, 86399LL, 144LL, 0x207fb1bfU},
++    {0x207fffffU, 86400LL, 144LL, 0x207fb1bfU},
++    {0x207fffffU, 86401LL, 144LL, 0x207fb1bfU},
++    {0x207fffffU, 1086400LL, 144LL, 0x207fffffU},
++    {0x207fffffU, 309744000LL, 144LL, 0x207fffffU},
++    {0x207fffffU, -309484800LL, 288LL, 0x01010000U},
++    {0x207fffffU, -827200LL, 288LL, 0x2002500dU},
++    {0x207fffffU, 172799LL, 288LL, 0x207fb1bfU},
++    {0x207fffffU, 172800LL, 288LL, 0x207fb1bfU},
++    {0x207fffffU, 172801LL, 288LL, 0x207fb1bfU},
++    {0x207fffffU, 1172800LL, 288LL, 0x207fffffU},
++    {0x207fffffU, 309830400LL, 288LL, 0x207fffffU},
++    {0x207fffffU, -249657600LL, 100000LL, 0x01010000U},
++    {0x207fffffU, 59000000LL, 100000LL, 0x2002500dU},
++    {0x207fffffU, 59999999LL, 100000LL, 0x207fb1bfU},
++    {0x207fffffU, 60000000LL, 100000LL, 0x207fb1bfU},
++    {0x207fffffU, 60000001LL, 100000LL, 0x207fb1bfU},
++    {0x207fffffU, 61000000LL, 100000LL, 0x207fffffU},
++    {0x207fffffU, 369657600LL, 100000LL, 0x207fffffU},
++    {0x207fffffU, 1288180530600LL, 2147483647LL, 0x01010000U},
++    {0x207fffffU, 1288489188200LL, 2147483647LL, 0x2002500dU},
++    {0x207fffffU, 1288490188199LL, 2147483647LL, 0x207fb1bfU},
++    {0x207fffffU, 1288490188200LL, 2147483647LL, 0x207fb1bfU},
++    {0x207fffffU, 1288490188201LL, 2147483647LL, 0x207fb1bfU},
++    {0x207fffffU, 1288491188200LL, 2147483647LL, 0x207fffffU},
++    {0x207fffffU, 1288799845800LL, 2147483647LL, 0x207fffffU},
++};
++inline constexpr bool DAA_ANCHORED{true};
++inline constexpr uint32_t DAA_FIRST_FAST_BITS{0x207fb1bfU};
++#endif
+diff --git a/src/test/data/asert_vectors.README.md b/src/test/data/asert_vectors.README.md
+new file mode 100644
+--- /dev/null
++++ b/src/test/data/asert_vectors.README.md
+@@ -0,0 +1,24 @@
++**Published ASERT test-vector subset**
++
++These numeric expected outcomes come from the [BCHN ASERT test-vector directory](https://download.bitcoincashnode.org/misc/data/asert/test_vectors/), linked by the [aserti3-2d specification](https://upgradespecs.bitcoincashnode.org/2020-11-15-asert/). Each run's anchor target is retained, timestamps are reduced by its anchor-parent timestamp, and heights by its anchor height. Expected bits are copied directly, not regenerated by the implementation.
++
++The subset retains the first/last ten rows and 32 evenly distributed positions from each run, removing overlaps. This covers steady schedules, stochastic/variable hashrate, limit saturation, and large absolute height/time conventions. C++ tests and the Python reference both check the subset. Absolute upstream heights beyond eCash's signed 32-bit index are reduced to their representable height difference for the pure arithmetic test.
++
++The entire twelve-run collection was also verified independently. To reproduce after downloading the runs, use `python3 contrib/daa_reference.py --upstream-dir /path/to/runs`. Regenerate both C++ headers with `--write-vectors`. No network fetch is needed for the checked-in subset.
++
++SHA256 and original row counts:
++
++```text
++run01  bfdbac6a3eb2ffaeecb8475ab7be4de61b780f1abc2ad858846a44d69d4a496e  10 rows, 10 retained
++run02  0db6f9bc26a3bb29a06ea2dec44606803c76aca8b903de0658e1cd40c00efc7d  10 rows, 10 retained
++run03  a21049dca0426086d4bc399ad962861e7e032f22a89e0bf7da8d0e1f99c7b790  10 rows, 10 retained
++run04  3d195813853c758920d49ce54e0d2048b5dbf66264d669a200c0b5b66138e025  225 rows, 48 retained
++run05  02d8a492d91f166fad424391830f8921de650f9820483300f8c90ba72a67238a  225 rows, 48 retained
++run06  12a0f7672327cf8887367cf93ed22c36ae1c3778352e922de771af15496812fe  1000 rows, 50 retained
++run07  8dae763a095cfe8ab6721e0bad23d433a4596ed8b0a9d9db9bc551c73be64111  1000 rows, 50 retained
++run08  7d19ee783dea42989d4a2d3ddf475a8c26e1f31fc1b517d348a4e3f7e6ec8403  500 rows, 50 retained
++run09  430d771c8c6c853e0aa8190e049826add47f517dfb9898a2bf0b5c7a3280c717  10 rows, 10 retained
++run10  34dff0a33085043626be6f1290a4089e18bd037010084b37bc67f14141121621  10 rows, 10 retained
++run11  f912d4fb2edcf65037fa7e8c279c49a291e8e74ce507b15b3478146fe653ad88  1000 rows, 50 retained
++run12  897418f85dcb17814ea7b7556547565271c524723ece8af8d47fab4bdc0ab179  10000 rows, 50 retained
++```
+diff --git a/src/test/data/asert_vectors.csv b/src/test/data/asert_vectors.csv
+new file mode 100644
+--- /dev/null
++++ b/src/test/data/asert_vectors.csv
+@@ -0,0 +1,397 @@
++# reference_bits,time_delta_from_anchor_parent,height_delta_from_anchor,expected_bits
++0x1d00ffff,1200,1,0x1d00ffff
++0x1d00ffff,1800,2,0x1d00ffff
++0x1d00ffff,2400,3,0x1d00ffff
++0x1d00ffff,3000,4,0x1d00ffff
++0x1d00ffff,3600,5,0x1d00ffff
++0x1d00ffff,4200,6,0x1d00ffff
++0x1d00ffff,4800,7,0x1d00ffff
++0x1d00ffff,5400,8,0x1d00ffff
++0x1d00ffff,6000,9,0x1d00ffff
++0x1d00ffff,6600,10,0x1d00ffff
++0x1a2b3c4d,1200,1,0x1a2b3c4d
++0x1a2b3c4d,1800,2,0x1a2b3c4d
++0x1a2b3c4d,2400,3,0x1a2b3c4d
++0x1a2b3c4d,3000,4,0x1a2b3c4d
++0x1a2b3c4d,3600,5,0x1a2b3c4d
++0x1a2b3c4d,4200,6,0x1a2b3c4d
++0x1a2b3c4d,4800,7,0x1a2b3c4d
++0x1a2b3c4d,5400,8,0x1a2b3c4d
++0x1a2b3c4d,6000,9,0x1a2b3c4d
++0x1a2b3c4d,6600,10,0x1a2b3c4d
++0x01010000,1200,1,0x01010000
++0x01010000,1800,2,0x01010000
++0x01010000,2400,3,0x01010000
++0x01010000,3000,4,0x01010000
++0x01010000,3600,5,0x01010000
++0x01010000,4200,6,0x01010000
++0x01010000,4800,7,0x01010000
++0x01010000,5400,8,0x01010000
++0x01010000,6000,9,0x01010000
++0x01010000,6600,10,0x01010000
++0x01010000,174000,1,0x01020000
++0x01010000,347400,2,0x01040000
++0x01010000,520800,3,0x01080000
++0x01010000,694200,4,0x01100000
++0x01010000,867600,5,0x01200000
++0x01010000,1041000,6,0x01400000
++0x01010000,1214400,7,0x02008000
++0x01010000,1387800,8,0x02010000
++0x01010000,1561200,9,0x02020000
++0x01010000,1734600,10,0x02040000
++0x01010000,2601600,15,0x03008000
++0x01010000,3815400,22,0x03400000
++0x01010000,5029200,29,0x04200000
++0x01010000,6416400,37,0x05200000
++0x01010000,7630200,44,0x06100000
++0x01010000,8844000,51,0x07080000
++0x01010000,10057800,58,0x08040000
++0x01010000,11445000,66,0x09040000
++0x01010000,12658800,73,0x0a020000
++0x01010000,13872600,80,0x0b010000
++0x01010000,15086400,87,0x0c008000
++0x01010000,16300200,94,0x0c400000
++0x01010000,17687400,102,0x0d400000
++0x01010000,18901200,109,0x0e200000
++0x01010000,20115000,116,0x0f100000
++0x01010000,21328800,123,0x10080000
++0x01010000,22716000,131,0x11080000
++0x01010000,23929800,138,0x12040000
++0x01010000,25143600,145,0x13020000
++0x01010000,26357400,152,0x14010000
++0x01010000,27571200,159,0x15008000
++0x01010000,28958400,167,0x16008000
++0x01010000,30172200,174,0x16400000
++0x01010000,31386000,181,0x17200000
++0x01010000,32599800,188,0x18100000
++0x01010000,33987000,196,0x19100000
++0x01010000,35200800,203,0x1a080000
++0x01010000,36414600,210,0x1b040000
++0x01010000,37455000,216,0x1c010000
++0x01010000,37628400,217,0x1c020000
++0x01010000,37801800,218,0x1c040000
++0x01010000,37975200,219,0x1c080000
++0x01010000,38148600,220,0x1c100000
++0x01010000,38322000,221,0x1c200000
++0x01010000,38495400,222,0x1c400000
++0x01010000,38668800,223,0x1d008000
++0x01010000,38842200,224,0x1d00ffff
++0x01010000,39015600,225,0x1d00ffff
++0x1d00ffff,0,1,0x1d00fec5
++0x1d00ffff,0,289,0x1c7f62c0
++0x1d00ffff,0,577,0x1c3fb160
++0x1d00ffff,0,865,0x1c1fd8b0
++0x1d00ffff,0,1153,0x1c0fec58
++0x1d00ffff,0,1441,0x1c07f62c
++0x1d00ffff,0,1729,0x1c03fb16
++0x1d00ffff,0,2017,0x1c01fd8b
++0x1d00ffff,0,2305,0x1c00fec5
++0x1d00ffff,0,2593,0x1b7f62c0
++0x1d00ffff,0,4033,0x1b03fb16
++0x1d00ffff,0,6049,0x1a07f62c
++0x1d00ffff,0,8065,0x190fec58
++0x1d00ffff,0,10369,0x180fec58
++0x1d00ffff,0,12385,0x171fd8b0
++0x1d00ffff,0,14401,0x163fb160
++0x1d00ffff,0,16417,0x157f62c0
++0x1d00ffff,0,18721,0x147f62c0
++0x1d00ffff,0,20737,0x1400fec5
++0x1d00ffff,0,22753,0x1301fd8b
++0x1d00ffff,0,24769,0x1203fb16
++0x1d00ffff,0,26785,0x1107f62c
++0x1d00ffff,0,29089,0x1007f62c
++0x1d00ffff,0,31105,0x0f0fec58
++0x1d00ffff,0,33121,0x0e1fd8b0
++0x1d00ffff,0,35137,0x0d3fb160
++0x1d00ffff,0,37441,0x0c3fb160
++0x1d00ffff,0,39457,0x0b7f62c0
++0x1d00ffff,0,41473,0x0b00fec5
++0x1d00ffff,0,43489,0x0a01fd8b
++0x1d00ffff,0,45505,0x0903fb16
++0x1d00ffff,0,47809,0x0803fb16
++0x1d00ffff,0,49825,0x0707f62c
++0x1d00ffff,0,51841,0x060fec58
++0x1d00ffff,0,53857,0x051fd8b0
++0x1d00ffff,0,56161,0x041fd8b0
++0x1d00ffff,0,58177,0x033fb160
++0x1d00ffff,0,60193,0x027f6200
++0x1d00ffff,0,61921,0x0201fd00
++0x1d00ffff,0,62209,0x0200fe00
++0x1d00ffff,0,62497,0x017f0000
++0x1d00ffff,0,62785,0x013f0000
++0x1d00ffff,0,63073,0x011f0000
++0x1d00ffff,0,63361,0x010f0000
++0x1d00ffff,0,63649,0x01070000
++0x1d00ffff,0,63937,0x01030000
++0x1d00ffff,0,64225,0x01010000
++0x1d00ffff,0,64513,0x01010000
++0x1802aee8,1200,1,0x1802aee8
++0x1802aee8,1310,2,0x1802ad91
++0x1802aee8,1327,3,0x1802abf8
++0x1802aee8,1739,4,0x1802ab73
++0x1802aee8,2219,5,0x1802ab20
++0x1802aee8,2604,6,0x1802aa89
++0x1802aee8,2746,7,0x1802a94b
++0x1802aee8,7099,8,0x1802b39c
++0x1802aee8,7099,9,0x1802b1f2
++0x1802aee8,7657,10,0x1802b1d4
++0x1802aee8,24981,33,0x1802bbae
++0x1802aee8,42647,65,0x1802b760
++0x1802aee8,61599,97,0x1802b6ae
++0x1802aee8,79167,129,0x1802b222
++0x1802aee8,95663,162,0x1802a910
++0x1802aee8,120141,194,0x1802b7a3
++0x1802aee8,143823,226,0x1802c449
++0x1802aee8,163885,258,0x1802c6bd
++0x1802aee8,184205,291,0x1802c83a
++0x1802aee8,205986,323,0x1802cfa6
++0x1802aee8,221242,355,0x1802c457
++0x1802aee8,239252,387,0x1802c0f4
++0x1802aee8,253248,419,0x1802b25d
++0x1802aee8,272468,452,0x1802b0c0
++0x1802aee8,291161,484,0x1802af58
++0x1802aee8,311159,516,0x1802b18e
++0x1802aee8,332256,548,0x1802b6d7
++0x1802aee8,361301,581,0x1802d123
++0x1802aee8,374378,613,0x1802bf9f
++0x1802aee8,390205,645,0x1802b623
++0x1802aee8,414107,677,0x1802c363
++0x1802aee8,434654,709,0x1802c739
++0x1802aee8,454119,742,0x1802c644
++0x1802aee8,469605,774,0x1802bbbe
++0x1802aee8,484520,806,0x1802afc9
++0x1802aee8,502709,838,0x1802ad02
++0x1802aee8,516713,871,0x18029d4d
++0x1802aee8,531419,903,0x1802915d
++0x1802aee8,547189,935,0x18028864
++0x1802aee8,566460,967,0x18028893
++0x1802aee8,583905,991,0x1802908a
++0x1802aee8,586689,992,0x1802964e
++0x1802aee8,586926,993,0x18029557
++0x1802aee8,587291,994,0x180294b7
++0x1802aee8,587688,995,0x1802942f
++0x1802aee8,587802,996,0x180292e6
++0x1802aee8,588403,997,0x180292e6
++0x1802aee8,588544,998,0x180291b0
++0x1802aee8,589215,999,0x180291e0
++0x1802aee8,589738,1000,0x180291ad
++0x1802aee8,1200,1,0x1802aee8
++0x1802aee8,1310,2,0x1802ad91
++0x1802aee8,1327,3,0x1802abf8
++0x1802aee8,1739,4,0x1802ab73
++0x1802aee8,2219,5,0x1802ab20
++0x1802aee8,2604,6,0x1802aa89
++0x1802aee8,2746,7,0x1802a94b
++0x1802aee8,7099,8,0x1802b39c
++0x1802aee8,7099,9,0x1802b1f2
++0x1802aee8,7657,10,0x1802b1d4
++0x1802aee8,14582,33,0x18029f19
++0x1802aee8,18116,65,0x18027642
++0x1802aee8,20213,97,0x18024c74
++0x1802aee8,21686,129,0x18022407
++0x1802aee8,22775,162,0x1801fc5d
++0x1802aee8,24089,194,0x1801d927
++0x1802aee8,25174,226,0x1801b801
++0x1802aee8,25966,258,0x180198b8
++0x1802aee8,26675,291,0x18017a9e
++0x1802aee8,27361,323,0x18015f80
++0x1802aee8,27789,355,0x18014605
++0x1802aee8,28251,387,0x18012e6a
++0x1802aee8,28580,419,0x18011859
++0x1802aee8,29002,452,0x1801035d
++0x1802aee8,29380,484,0x1800f07e
++0x1802aee8,29760,516,0x1800df02
++0x1802aee8,30136,548,0x1800cece
++0x1802aee8,30632,581,0x1800bf6a
++0x1802aee8,30834,613,0x1800b15d
++0x1802aee8,31069,645,0x1800a45f
++0x1802aee8,31415,677,0x18009867
++0x1802aee8,31692,709,0x18008d41
++0x1802aee8,31943,742,0x18008297
++0x1802aee8,32129,774,0x1778fed7
++0x1802aee8,32302,806,0x17701b77
++0x1802aee8,32505,838,0x1767e37b
++0x1802aee8,32652,871,0x176005b7
++0x1802aee8,32803,903,0x1758f4e3
++0x1802aee8,32958,935,0x17526a0c
++0x1802aee8,33145,967,0x174c5d53
++0x1802aee8,33311,991,0x17481f9f
++0x1802aee8,33338,992,0x1747f55c
++0x1802aee8,33340,993,0x1747c917
++0x1802aee8,33343,994,0x17479cfc
++0x1802aee8,33346,995,0x17477136
++0x1802aee8,33347,996,0x17474546
++0x1802aee8,33353,997,0x174719ac
++0x1802aee8,33354,998,0x1746ede7
++0x1802aee8,33360,999,0x1746c2cd
++0x1802aee8,33365,1000,0x17469789
++0x1802aee8,1200,1,0x1802aee8
++0x1802aee8,1310,2,0x1802ad91
++0x1802aee8,1327,3,0x1802abf8
++0x1802aee8,1739,4,0x1802ab73
++0x1802aee8,2219,5,0x1802ab20
++0x1802aee8,2604,6,0x1802aa89
++0x1802aee8,2746,7,0x1802a94b
++0x1802aee8,7099,8,0x1802b39c
++0x1802aee8,7099,9,0x1802b1f2
++0x1802aee8,7657,10,0x1802b1d4
++0x1802aee8,18343,17,0x1802c40e
++0x1802aee8,53537,33,0x1803109d
++0x1802aee8,96126,49,0x18037f7c
++0x1802aee8,145532,65,0x18041a91
++0x1802aee8,188533,81,0x1804b157
++0x1802aee8,317896,97,0x180795e1
++0x1802aee8,408962,113,0x180a84c3
++0x1802aee8,527010,129,0x18103fec
++0x1802aee8,643838,145,0x1818fc3a
++0x1802aee8,769848,161,0x1827db4e
++0x1802aee8,969311,178,0x185525de
++0x1802aee8,1226790,194,0x1900e61e
++0x1802aee8,1431075,210,0x1901f679
++0x1802aee8,1737836,226,0x1906771c
++0x1802aee8,1951261,242,0x190ea482
++0x1802aee8,2236381,258,0x192c398b
++0x1802aee8,2445886,274,0x19629bce
++0x1802aee8,2771080,290,0x1a015db3
++0x1802aee8,3169530,306,0x1a067fb4
++0x1802aee8,3462640,322,0x1a14441a
++0x1802aee8,3728004,339,0x1a386444
++0x1802aee8,4011072,355,0x1b00a8e9
++0x1802aee8,4279774,371,0x1b01dd82
++0x1802aee8,4691875,387,0x1b096030
++0x1802aee8,4924277,403,0x1b16eaa0
++0x1802aee8,5264121,419,0x1b562e80
++0x1802aee8,5709375,435,0x1c01eeac
++0x1802aee8,6094989,451,0x1c08bbac
++0x1802aee8,6431467,467,0x1c206707
++0x1802aee8,6930238,483,0x1d00e688
++0x1802aee8,7216733,491,0x1d00ffff
++0x1802aee8,7226083,492,0x1d00ffff
++0x1802aee8,7284983,493,0x1d00ffff
++0x1802aee8,7290833,494,0x1d00ffff
++0x1802aee8,7293683,495,0x1d00ffff
++0x1802aee8,7343383,496,0x1d00ffff
++0x1802aee8,7387333,497,0x1d00ffff
++0x1802aee8,7388383,498,0x1d00ffff
++0x1802aee8,7421433,499,0x1d00ffff
++0x1802aee8,7462933,500,0x1d00ffff
++0x1802aee8,900,1,0x1802ae16
++0x1802aee8,1200,2,0x1802ad44
++0x1802aee8,1500,3,0x1802ac71
++0x1802aee8,1800,4,0x1802ab9e
++0x1802aee8,2100,5,0x1802aacd
++0x1802aee8,2400,6,0x1802a9fa
++0x1802aee8,2700,7,0x1802a929
++0x1802aee8,3000,8,0x1802a858
++0x1802aee8,3300,9,0x1802a787
++0x1802aee8,3600,10,0x1802a6b7
++0x1802aee8,1500,1,0x1802afbb
++0x1802aee8,2400,2,0x1802b08f
++0x1802aee8,3300,3,0x1802b166
++0x1802aee8,4200,4,0x1802b23a
++0x1802aee8,5100,5,0x1802b30e
++0x1802aee8,6000,6,0x1802b3e5
++0x1802aee8,6900,7,0x1802b4bb
++0x1802aee8,7800,8,0x1802b592
++0x1802aee8,8700,9,0x1802b669
++0x1802aee8,9600,10,0x1802b73d
++0x1802aee8,1200,1,0x1802aee8
++0x1802aee8,1496,2,0x1802ae12
++0x1802aee8,1398,3,0x1802ac28
++0x1802aee8,1996,4,0x1802ac28
++0x1802aee8,1731,5,0x1802a9cb
++0x1802aee8,1816,6,0x1802a863
++0x1802aee8,2113,7,0x1802a790
++0x1802aee8,2318,8,0x1802a67e
++0x1802aee8,2679,9,0x1802a5d7
++0x1802aee8,3289,10,0x1802a5df
++0x1802aee8,9614,33,0x180291e0
++0x1802aee8,18236,65,0x18027690
++0x1802aee8,30215,97,0x1802648e
++0x1802aee8,36477,129,0x18024590
++0x1802aee8,44850,162,0x18022b7b
++0x1802aee8,58132,194,0x18021e6f
++0x1802aee8,68739,226,0x18020c09
++0x1802aee8,75698,258,0x1801f2e9
++0x1802aee8,86668,291,0x1801e18b
++0x1802aee8,95785,323,0x1801ce75
++0x1802aee8,106385,355,0x1801bec7
++0x1802aee8,115625,387,0x1801ad4c
++0x1802aee8,129600,419,0x1801a466
++0x1802aee8,140651,452,0x180195ec
++0x1802aee8,147949,484,0x18018304
++0x1802aee8,156150,516,0x18017253
++0x1802aee8,165458,548,0x180163e9
++0x1802aee8,175478,581,0x18015631
++0x1802aee8,185070,613,0x18014946
++0x1802aee8,195032,645,0x18013d4e
++0x1802aee8,206209,677,0x18013342
++0x1802aee8,215533,709,0x18012751
++0x1802aee8,223762,742,0x180119e9
++0x1802aee8,231050,774,0x18010cbe
++0x1802aee8,237126,806,0x1800fef2
++0x1802aee8,246190,838,0x1800f4c9
++0x1802aee8,258786,871,0x1800edcf
++0x1802aee8,267091,903,0x1800e3a5
++0x1802aee8,274465,935,0x1800d91b
++0x1802aee8,285234,967,0x1800d1e4
++0x1802aee8,292311,991,0x1800cbd3
++0x1802aee8,292068,992,0x1800cb22
++0x1802aee8,292691,993,0x1800cb28
++0x1802aee8,293156,994,0x1800cb0c
++0x1802aee8,292897,995,0x1800ca59
++0x1802aee8,293056,996,0x1800c9fd
++0x1802aee8,293558,997,0x1800c9e9
++0x1802aee8,293356,998,0x1800c943
++0x1802aee8,293956,999,0x1800c943
++0x1802aee8,293713,1000,0x1800c896
++0x1802aee8,1200,1,0x1802aee8
++0x1802aee8,1199,2,0x1802ad44
++0x1802aee8,1198,3,0x1802ab9e
++0x1802aee8,1197,4,0x1802a9f9
++0x1802aee8,1196,5,0x1802a855
++0x1802aee8,1195,6,0x1802a6b3
++0x1802aee8,1194,7,0x1802a511
++0x1802aee8,1193,8,0x1802a371
++0x1802aee8,1192,9,0x1802a1d1
++0x1802aee8,1191,10,0x1802a033
++0x1802aee8,878,323,0x18013c18
++0x1802aee8,555,646,0x18009116
++0x1802aee8,233,968,0x1742c04d
++0x1802aee8,-90,1291,0x171ea33d
++0x1802aee8,-412,1613,0x170e18db
++0x1802aee8,-735,1936,0x170678a4
++0x1802aee8,-1057,2258,0x1702fa51
++0x1802aee8,-1380,2581,0x17015de6
++0x1802aee8,-1702,2903,0x1700a100
++0x1802aee8,-2025,3226,0x1649e6c4
++0x1802aee8,-2348,3549,0x1621eb2d
++0x1802aee8,-2670,3871,0x160f9afd
++0x1802aee8,-2993,4194,0x160729bc
++0x1802aee8,-3315,4516,0x16034bcd
++0x1802aee8,-3638,4839,0x16018359
++0x1802aee8,-3960,5161,0x1600b23a
++0x1802aee8,-4283,5484,0x1551ceed
++0x1802aee8,-4605,5806,0x1525a464
++0x1802aee8,-4928,6129,0x151146e1
++0x1802aee8,-5250,6451,0x1507f2e4
++0x1802aee8,-5573,6774,0x1503a603
++0x1802aee8,-5896,7097,0x1501acbe
++0x1802aee8,-6218,7419,0x1500c54b
++0x1802aee8,-6541,7742,0x145a9017
++0x1802aee8,-6863,8064,0x1429ab16
++0x1802aee8,-7186,8387,0x14132083
++0x1802aee8,-7508,8709,0x1408ccd7
++0x1802aee8,-7831,9032,0x140409fc
++0x1802aee8,-8153,9354,0x1401dbbd
++0x1802aee8,-8476,9677,0x1400da61
++0x1802aee8,-8790,9991,0x136671dd
++0x1802aee8,-8791,9992,0x136632cf
++0x1802aee8,-8792,9993,0x1365f3c1
++0x1802aee8,-8793,9994,0x1365b508
++0x1802aee8,-8794,9995,0x13657650
++0x1802aee8,-8795,9996,0x136537ed
++0x1802aee8,-8796,9997,0x1364f98b
++0x1802aee8,-8797,9998,0x1364bb7e
++0x1802aee8,-8798,9999,0x13647d71
++0x1802aee8,-8799,10000,0x13643f64
+diff --git a/test/functional/feature_daa.py b/test/functional/feature_daa.py
+new file mode 100644
+--- /dev/null
++++ b/test/functional/feature_daa.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The eCash developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Exercise this patch's compiled DAA in isolated regtest, including per-block adjustments and reorgs."""
++
++from test_framework.blocktools import create_block, create_coinbase
++from test_framework.daa import H, INTERVAL, next_bits
++from test_framework.messages import CBlockHeader, MAGIC_BYTES
++from test_framework.p2p import P2PInterface
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal, assert_raises_rpc_error
++
++# Existing eCash identity, scoped to this test; no production identity change.
++MAGIC_BYTES['regtest'] = bytes.fromhex('eca5b134')
++
++
++class DAATest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.setup_clean_chain = True
++        self.num_nodes = 3
++        # Upstream's framework writes bitcoin.conf; eCash defaults to ecash.conf.
++        self.extra_args = [
++            ['-conf=bitcoin.conf', '-test=daa'],
++            ['-conf=bitcoin.conf', '-test=daa', '-minimumchainwork=0x400'],
++            ['-conf=bitcoin.conf'],
++        ]
++
++    def setup_network(self):
++        self.setup_nodes()
++
++    def mine(self, end, *, alternate=False):
++        node = self.nodes[0]
++        while len(self.bits) <= end:
++            height = len(self.bits)
++            if alternate:
++                delta = 1300 if height == H-2 else 300
++            elif height < 180:
++                delta = 600
++            elif height < H+INTERVAL:
++                delta = 300
++            elif height < H+2*INTERVAL:
++                delta = 150
++            elif height < H+3*INTERVAL:
++                delta = 3600
++            else:
++                delta = 60 if height % 2 else 1140
++                if height == H+3*INTERVAL+40:
++                    delta = -100  # Valid raw time reversal, above previous MTP.
++            timestamp = max(self.times[-1]+delta, 1_600_000_000)
++            node.setmocktime(timestamp+10)
++            required = next_bits(self.bits, self.times, height)
++            if height >= H:
++                template = node.getblocktemplate({'rules': ['segwit', 'bip300301']})
++                assert_equal(int(template['bits'],16), required)
++            block = create_block(int(node.getbestblockhash(),16), create_coinbase(height), timestamp)
++            block.nBits = required
++            if height in {H, H+1, 288, H+INTERVAL, H+2*INTERVAL}:
++                wrong = CBlockHeader(block)
++                wrong.nBits = required-1
++                # Header and full-block validation must reject the wrong bits.
++                # Solve with a temporary block so header PoW is genuinely valid.
++                block.nBits = wrong.nBits
++                block.solve()
++                wrong = CBlockHeader(block)
++                assert_raises_rpc_error(-25, 'bad-diffbits', node.submitheader, wrong.serialize().hex())
++                assert_equal(node.submitblock(block.serialize().hex()), 'bad-diffbits')
++                block.nBits = required
++            block.solve()
++            assert_equal(node.submitblock(block.serialize().hex()), None)
++            self.bits.append(required)
++            self.times.append(timestamp)
++            self.hashes.append(node.getbestblockhash())
++
++    def run_test(self):
++        node, peer, standard = self.nodes
++        node.add_p2p_connection(P2PInterface())
++        genesis = node.getblock(node.getbestblockhash())
++        self.bits = [int(genesis['bits'],16)]
++        self.times = [genesis['time']]
++        self.hashes = [node.getbestblockhash()]
++        self.log.info('Constant, changing, and oscillating timings across activation and per-block retargets')
++        self.mine(H+4*INTERVAL)
++        assert_equal(self.bits[H],self.bits[H-1])
++        assert self.bits[H+1] != self.bits[H]
++        assert self.bits[H+2] != self.bits[H+1]
++        peer.setmocktime(self.times[-1]+10)
++        self.log.info('Download headers through presync and redownload, then validate blocks')
++        self.connect_nodes(0,1)
++        self.sync_blocks(self.nodes[:2])
++        self.log.info('Standard regtest still has no retargeting')
++        self.generatetoaddress(standard, 145, standard.get_deterministic_priv_key().address, sync_fun=self.no_op)
++        assert_equal(standard.getblock(standard.getbestblockhash())['bits'],'207fffff')
++        self.log.info('Reorganize across activation and replace the fixed anchor and its parent')
++        self.disconnect_nodes(0,1)
++        node.invalidateblock(self.hashes[H-2])
++        self.bits = self.bits[:H-2]
++        self.times = self.times[:H-2]
++        self.hashes = self.hashes[:H-2]
++        self.mine(H+5*INTERVAL, alternate=True)
++        self.restart_node(0, extra_args=self.extra_args[0])
++        assert_equal(node.getblock(node.getbestblockhash())['bits'],f'{self.bits[-1]:08x}')
++        peer.setmocktime(self.times[-1]+10)
++        self.connect_nodes(0,1)
++        self.sync_blocks(self.nodes[:2])
++
++
++if __name__ == '__main__':
++    DAATest(__file__).main()
+diff --git a/test/functional/test_framework/daa.py b/test/functional/test_framework/daa.py
+new file mode 100644
+--- /dev/null
++++ b/test/functional/test_framework/daa.py
+@@ -0,0 +1,63 @@
++# Copyright (c) 2026 The eCash developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""ASERT integer specification and independent Decimal oracle.
++
++One compiled algorithm per patch; ALGORITHM is a test label, not a node flag.
++"""
++from decimal import Decimal, localcontext
++
++ALGORITHM = 'asert'
++INTERVAL, SPACING, TIMESPAN, K, H = 144, 600, 86400, 14, 200
++HALF_LIFE = 172800
++POW_LIMIT = (1 << 255) - 1
++RELATIVE_TOLERANCE = Decimal('1.5e-4')
++
++def decode(bits):
++    size, word = bits >> 24, bits & 0x7fffff
++    assert not bits & 0x800000
++    return word >> (8 * (3-size)) if size <= 3 else word << (8 * (size-3))
++
++def compact(target):
++    size = (target.bit_length()+7)//8
++    word = target << (8*(3-size)) if size <= 3 else target >> (8*(size-3))
++    if word & 0x800000:
++        word >>= 8
++        size += 1
++    return (size << 24) | word
++
++def integer_target(bits, seconds, heights, limit=POW_LIMIT):
++    error = seconds-SPACING*(heights+1)
++    if error >= 256*HALF_LIFE:
++        return limit
++    if error <= -256*HALF_LIFE:
++        return 1
++    magnitude = abs(error)*65536//HALF_LIFE
++    exponent = -magnitude if error < 0 else magnitude
++    shifts, fraction = divmod(exponent,65536)
++    factor = 65536 + ((195766423245049*fraction + 971821376*fraction**2 +
++                      5127*fraction**3 + (1 << 47)) >> 48)
++    value = decode(bits)*factor
++    shift = shifts-16
++    value = value << shift if shift >= 0 else value >> -shift
++    return min(limit,max(1,value))
++
++def calculate(bits, seconds, heights, limit=POW_LIMIT):
++    return compact(integer_target(bits,seconds,heights,limit))
++
++def real_target(bits, seconds, heights, limit=POW_LIMIT, precision=120):
++    with localcontext() as ctx:
++        ctx.prec = precision
++        error = seconds-SPACING*(heights+1)
++        if error >= 256*HALF_LIFE:
++            return Decimal(limit)
++        if error <= -256*HALF_LIFE:
++            return Decimal(1)
++        value = Decimal(decode(bits))*(Decimal(2).ln()*Decimal(error)/HALF_LIFE).exp()
++        return min(Decimal(limit),max(Decimal(1),value))
++
++def next_bits(bits,times,height):
++    if height <= H:
++        return bits[-1]
++    last = height-1
++    return calculate(bits[H-1],times[last]-times[H-2],last-(H-1))
+diff --git a/test/functional/test_runner.py b/test/functional/test_runner.py
+--- a/test/functional/test_runner.py
++++ b/test/functional/test_runner.py
+@@ -291,6 +291,7 @@
+     'wallet_importdescriptors.py',
+     'wallet_crosschain.py',
+     'mining_basic.py',
++    'feature_daa.py',
+     'mining_mainnet.py',
+     'feature_signet.py',
+     'p2p_mutated_blocks.py',
